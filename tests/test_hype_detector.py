@@ -40,3 +40,22 @@ def test_cooldown_keeps_strongest_bucket_of_a_burst():
 def test_spikes_separated_by_more_than_cooldown_are_both_kept():
     counts = [4] * 20 + [20] + [4] * 5 + [20] + [4] * 5
     assert [i for i, _ in detect_spike_buckets(counts, **PARAMS)] == [20, 26]
+
+
+def test_bucketize_empty_inputs():
+    assert bucketize([], start=0.0, end=25.0, bucket_s=10) == [0, 0, 0]
+    assert bucketize([1.0], start=5.0, end=5.0, bucket_s=10) == []
+
+
+def test_zero_baseline_uses_only_min_messages_floor():
+    counts = [0] * 10 + [5] + [0] * 5
+    assert detect_spike_buckets(counts, **PARAMS) == [(10, 0.0)]
+
+
+def test_cooldown_tie_keeps_first_and_long_burst_is_single_peak():
+    assert [i for i, _ in detect_spike_buckets([4] * 20 + [20, 20] + [4] * 10, **PARAMS)] == [20]
+    assert len(detect_spike_buckets([4] * 20 + [30] * 8 + [4] * 5, **PARAMS)) == 1
+
+
+def test_empty_counts():
+    assert detect_spike_buckets([], **PARAMS) == []

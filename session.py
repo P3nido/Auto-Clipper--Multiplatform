@@ -38,8 +38,23 @@ class RecordingSegment:
 
         Retorna None se wall_ts estiver fora do segmento ou dentro de um anúncio.
         offset = wall_ts - wall_start - soma(anúncios que terminaram antes de wall_ts)
+
+        Limites inclusivos [wall_start, wall_end]; wall_end None = ainda gravando
+        (sem limite superior); wall_start None = None. Um anúncio (ini, dur) cobre
+        [ini, ini + dur): dentro dele -> None; com ini + dur <= wall_ts, soma.
         """
-        raise NotImplementedError
+        if self.wall_start is None or wall_ts < self.wall_start:
+            return None
+        if self.wall_end is not None and wall_ts > self.wall_end:
+            return None
+        removed = 0.0
+        for ad_start, ad_dur in self.ad_breaks:
+            ad_end = ad_start + ad_dur
+            if ad_start <= wall_ts < ad_end:
+                return None
+            if ad_end <= wall_ts:
+                removed += ad_dur
+        return wall_ts - self.wall_start - removed
 
 
 @dataclass

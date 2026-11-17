@@ -32,3 +32,17 @@ def test_max_clips_keeps_strongest_in_chronological_order():
     spikes = [spike(100, 10), spike(200, 50), spike(300, 30)]
     clips = plan_clips(spikes, {0: 600}, pre_s=15, post_s=15, max_clips=2)
     assert [c.start_s for c in clips] == [185, 285]
+
+
+def test_empty_and_unknown_segment_ignored():
+    assert plan_clips([], {0: 600}, **KW) == []
+    assert plan_clips([spike(100, seg=7)], {0: 600}, **KW) == []
+
+
+def test_short_window_discarded():
+    assert plan_clips([spike(599)], {0: 600}, pre_s=1, post_s=1, max_clips=5) == []
+
+
+def test_max_clips_tie_prefers_earliest():
+    clips = plan_clips([spike(100, 20), spike(300, 20)], {0: 600}, pre_s=15, post_s=15, max_clips=1)
+    assert [c.start_s for c in clips] == [85]

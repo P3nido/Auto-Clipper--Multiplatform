@@ -109,7 +109,7 @@ Implementado como funções puras em `hype_detector.py`, totalmente testáveis s
 1. `bucketize`: conta mensagens por bloco contíguo de `BUCKET_SECONDS` (10 s), indexado a partir do `wall_start` do segmento. Blocos vazios entram com contagem 0.
 2. Linha de base de cada bloco *i*: média dos `BASELINE_WINDOW_BUCKETS` blocos **anteriores** (o bloco atual fica de fora, senão ele mesmo infla a média).
 3. O bloco *i* é pico se: `i ≥ WARMUP_BUCKETS` **e** `count ≥ SPIKE_MULTIPLIER × base` **e** `count ≥ MIN_MESSAGES_PER_BUCKET`. O piso absoluto evita que 1→4 mensagens num chat parado conte como "hype".
-4. Cooldown: depois de um pico, picos a menos de `SPIKE_COOLDOWN_S` são ignorados. Dentro de uma rajada contínua, fica o bloco de maior contagem.
+4. Cooldown: candidatos a menos de `SPIKE_COOLDOWN_S` do candidato **anterior** formam uma mesma rajada, que vai se encadeando. Da rajada fica só o bloco de maior contagem (no empate, o primeiro). Assim, um hype longo e contínuo vira **um** clipe, e não vários clipes colados.
 5. O instante do pico é o **centro** do bloco.
 
 ## 6. Concorrência e encerramento
@@ -163,7 +163,7 @@ Reconexão: o `ChatListener` envolve qualquer fonte com backoff exponencial de 1
 | Fase | Entrega | Responsável |
 |---|---|---|
 | 0 | Base: arquitetura, esqueletos, config, agents, skills | orquestrador ✅ |
-| 1 | `hype_detector` + `clipper.plan_clips` (puros) com testes verdes | coder → qa-explorer |
+| 1 | `hype_detector` + `clipper.plan_clips` + `wall_to_offset` (puros) com testes verdes | coder → qa-explorer ✅ |
 | 2 | `session` + `recorder` (gravar uma live real da Twitch por 2 min) | coder → qa-explorer |
 | 3 | `chat_listener`: Twitch IRC → Kick → spike do YouTube | coder → qa-explorer |
 | 4 | `clipper.cut_clip` + `transcriber` (com um `.ts` de amostra) | coder → qa-explorer |

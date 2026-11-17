@@ -22,3 +22,17 @@ def test_ads_before_are_subtracted_and_inside_is_none():
     assert s.wall_to_offset(1040.0) == 40.0
     assert s.wall_to_offset(1060.0) is None
     assert s.wall_to_offset(1100.0) == 70.0
+
+
+def test_inclusive_bounds_and_open_segment():
+    assert seg().wall_to_offset(1000.0) == 0.0
+    assert seg().wall_to_offset(2000.0) == 1000.0
+    open_seg = RecordingSegment(index=0, path=Path("x.ts"), wall_start=1000.0)
+    assert open_seg.wall_to_offset(9999.0) == 8999.0
+    assert RecordingSegment(index=0, path=Path("x.ts")).wall_to_offset(1.0) is None
+
+
+def test_ad_boundaries():
+    s = seg(ad_breaks=[(1050.0, 30.0)])
+    assert s.wall_to_offset(1050.0) is None
+    assert s.wall_to_offset(1080.0) == 50.0
