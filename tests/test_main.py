@@ -1,16 +1,15 @@
-"""Testes do orquestrador (main.py) sem rede, ffmpeg ou whisper reais."""
+"""Testes da CLI (main.py). A lógica de gravação/clipes é testada em test_engine.py."""
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
 
 import pytest
 
 import config
+import engine
+import hardware
 import main
-from clipper import ClipperError, ClipSpec
-from hype_detector import Spike
 from session import Session
 
 URL = "https://www.twitch.tv/canal"
@@ -27,178 +26,121 @@ def _isolated(tmp_path, monkeypatch):
             h.close()
 
 
-def _session_with_segment(tmp_path) -> Session:
+class _FakeManager:
+    instances: list["_FakeManager"] = []
+
+    def __init__(self, on_update=None):
+        self.on_update = on_update
+        self.added: list[tuple[str, bool, float | None]] = []
+        self.stopped: list[str] = []
+        self.states: dict[str, engine.JobState] = {}
+        self.shutdowns = 0
+        _FakeManager.instances.append(self)
+
+    def add(self, url, *, once=True, max_duration=None):
+        job_id = f"j{len(self.added)}"
+        self.added.append((url, once, max_duration))
+        self.states[job_id] = engine.JobState.DONE
+        return job_id
+
+    def status(self, job_id):
+        return engine.JobStatus(job_id, "u", "twitch", "c", self.states[job_id], "m")
+
+    def stop(self, job_id):
+        self.stopped.append(job_id)
+
+    def shutdown(self, wait=True):
+        self.shutdowns += 1
+
+
+@pytest.fixture
+def fake_manager(monkeypatch):
+    _FakeManager.instances = []
+    monkeypatch.setattr(main, "JobManager", _FakeManager)
+    monkeypatch.setattr(main, "check_prerequisites", lambda url=None: None)
+    return _FakeManager
+
+
+def test_multiple_urls_create_multiple_jobs(fake_manager):
+    code = main.main(["--url", URL, "--url", "https://kick.com/outro", "--once", "--max-duration", "5"])
+    assert code == 0
+    mgr = fake_manager.instances[0]
+    assert mgr.added == [(URL, True, 5.0), ("https://kick.com/outro", True, 5.0)]
+    assert mgr.shutdowns >= 1
+
+
+def test_default_url_from_config(fake_manager, monkeypatch):
+    monkeypatch.setattr(config, "STREAM_URL", URL)
+    assert main.main([]) == 0
+    assert fake_manager.instances[0].added == [(URL, False, None)]
+
+
+def test_error_job_returns_1(fake_manager, monkeypatch):
+    orig = _FakeManager.add
+
+    def add(self, url, **kw):
+        job_id = orig(self, url, **kw)
+        self.states[job_id] = engine.JobState.ERROR
+        return job_id
+
+    monkeypatch.setattr(_FakeManager, "add", add)
+    assert main.main(["--url", URL]) == 1
+
+
+def test_add_rejection_returns_1(fake_manager, monkeypatch):
+    def add(self, url, **kw):
+        raise ValueError("duplicado")
+
+    monkeypatch.setattr(_FakeManager, "add", add)
+    assert main.main(["--url", URL]) == 1
+
+
+def test_diagnostico_prints_report(monkeypatch, capsys):
+    monkeypatch.setattr(main, "_resolve_ffmpeg_tools", lambda: None)
+    monkeypatch.setattr(hardware, "diagnose", lambda: "RELATORIO FALSO")
+    assert main.main(["--diagnostico"]) == 0
+    assert "RELATORIO FALSO" in capsys.readouterr().out
+
+
+def test_process_calls_process_session(tmp_path, monkeypatch):
     session = Session.create(URL, tmp_path)
-    seg = session.new_segment()
-    seg.path.write_bytes(b"x" * 10)
-    return session
+    calls = []
+
+    def fake(s, **kw):
+        calls.append(s.root)
+        s.status["postprocess"] = "ok: 0/0 clipes"
+        return []
+
+    monkeypatch.setattr(main, "check_prerequisites", lambda url=None: None)
+    monkeypatch.setattr(main, "process_session", fake)
+    assert main.main(["--process", str(session.root)]) == 0
+    assert calls == [session.root]
 
 
-def _patch_pipeline(monkeypatch, specs, fail_render_on=(), no_audio=False):
-    monkeypatch.setattr(main, "find_spikes", lambda s: [Spike(0, 50.0, 20, 4.0)])
-    monkeypatch.setattr(main, "probe_duration", lambda p: 600.0)
-    monkeypatch.setattr(main, "plan_clips", lambda *a, **k: specs)
-    seen: dict = {"wavs": [], "srts": {}}
+def test_process_error_status_returns_1(tmp_path, monkeypatch):
+    session = Session.create(URL, tmp_path)
 
-    def extract(src, spec, wav):
-        if no_audio:
-            raise ClipperError("sem trilha de áudio")
-        wav.write_bytes(b"w")
-        seen["wavs"].append(wav)
-        return wav
+    def fake(s, **kw):
+        s.status["postprocess"] = "erro: sem modelo"
+        return []
 
-    monkeypatch.setattr(main, "extract_audio", extract)
-    monkeypatch.setattr(main, "transcribe_to_srt", lambda m, wav, srt: (srt.write_text("s"), srt)[1])
-
-    def render(src, spec, out, srt=None):
-        if any(k in out.name for k in fail_render_on):
-            raise RuntimeError("render falhou")
-        seen["srts"][out.name] = srt
-        out.write_bytes(b"f")
-        return out
-
-    monkeypatch.setattr(main, "render_clip", render)
-    return seen
-
-
-def test_postprocess_second_clip_fails(tmp_path, monkeypatch):
-    session = _session_with_segment(tmp_path)
-    specs = [ClipSpec(0, 10.0, 30.0, 20), ClipSpec(0, 100.0, 30.0, 15)]
-    _patch_pipeline(monkeypatch, specs, fail_render_on=("clip_02",))
-    monkeypatch.setattr(main, "load_model", lambda: object())
-    finals = main.postprocess(session)
-    assert len(finals) == 1
-    assert finals[0].name == "clip_01_seg0_00m10s.mp4"
-    assert session.status["postprocess"] == "parcial: 1/2 clipes"
-    assert session.segments[0].path.exists()
-
-
-def test_postprocess_no_spikes_does_not_load_model(tmp_path, monkeypatch):
-    session = _session_with_segment(tmp_path)
-    _patch_pipeline(monkeypatch, [])
-
-    def boom():
-        raise AssertionError("modelo não deveria ser carregado")
-
-    monkeypatch.setattr(main, "load_model", boom)
-    assert main.postprocess(session) == []
-    assert session.status["postprocess"].startswith("ok")
-
-
-def test_postprocess_model_failure(tmp_path, monkeypatch):
-    session = _session_with_segment(tmp_path)
-    _patch_pipeline(monkeypatch, [ClipSpec(0, 10.0, 30.0, 20)])
-
-    def fail():
-        raise RuntimeError("sem modelo")
-
-    monkeypatch.setattr(main, "load_model", fail)
-    assert main.postprocess(session) == []
-    assert session.status["postprocess"].startswith("erro")
-
-
-def test_postprocess_deletes_raw_when_all_ok(tmp_path, monkeypatch):
-    session = _session_with_segment(tmp_path)
-    _patch_pipeline(monkeypatch, [ClipSpec(0, 10.0, 30.0, 20)])
-    monkeypatch.setattr(main, "load_model", lambda: object())
-    monkeypatch.setattr(config, "DELETE_RAW_AFTER_PROCESS", True)
-    assert len(main.postprocess(session)) == 1
-    assert not session.segments[0].path.exists()
-
-
-def test_postprocess_wav_deleted_and_srt_used(tmp_path, monkeypatch):
-    session = _session_with_segment(tmp_path)
-    seen = _patch_pipeline(monkeypatch, [ClipSpec(0, 10.0, 30.0, 20)])
-    monkeypatch.setattr(main, "load_model", lambda: object())
-    assert len(main.postprocess(session)) == 1
-    assert len(seen["wavs"]) == 1 and not seen["wavs"][0].exists()
-    assert seen["srts"]["clip_01_seg0_00m10s.mp4"] is not None
-
-
-def test_postprocess_wav_deleted_even_if_render_fails(tmp_path, monkeypatch):
-    session = _session_with_segment(tmp_path)
-    seen = _patch_pipeline(monkeypatch, [ClipSpec(0, 10.0, 30.0, 20)], fail_render_on=("clip_01",))
-    monkeypatch.setattr(main, "load_model", lambda: object())
-    assert main.postprocess(session) == []
-    assert not seen["wavs"][0].exists()
-
-
-def test_postprocess_segment_without_audio_renders_without_subs(tmp_path, monkeypatch):
-    session = _session_with_segment(tmp_path)
-    seen = _patch_pipeline(monkeypatch, [ClipSpec(0, 10.0, 30.0, 20)], no_audio=True)
-    monkeypatch.setattr(main, "load_model", lambda: object())
-    finals = main.postprocess(session)
-    assert len(finals) == 1 and finals[0].exists()
-    assert seen["srts"]["clip_01_seg0_00m10s.mp4"] is None
-    assert session.status["postprocess"] == "ok: 1/1 clipes"
-
-
-class _FakeSource:
-    pass
-
-
-class _FakeChat:
-    def __init__(self, session, source, stop_event):
-        self.stop_event = stop_event
-        self.message_count = 0
-        self.reconnect_count = 0
-
-    def run(self):
-        self.stop_event.wait()
-
-
-def test_run_session_recorder_finishes_alone(monkeypatch):
-    class QuickRecorder:
-        def __init__(self, session, stop_event):
-            self.stop_event = stop_event
-
-        def run(self):
-            self.stop_event.set()
-
-    monkeypatch.setattr(main, "Recorder", QuickRecorder)
-    monkeypatch.setattr(main, "ChatListener", _FakeChat)
-    monkeypatch.setattr(main, "make_chat_source", lambda url: _FakeSource())
-    session = main.run_session(URL)
-    assert session.status["record"] == "ok"
-    assert session.manifest_path.exists()
-
-
-def test_run_session_max_duration(monkeypatch):
-    class WaitingRecorder:
-        def __init__(self, session, stop_event):
-            self.stop_event = stop_event
-
-        def run(self):
-            self.stop_event.wait()
-
-    monkeypatch.setattr(main, "Recorder", WaitingRecorder)
-    monkeypatch.setattr(main, "ChatListener", _FakeChat)
-    monkeypatch.setattr(main, "make_chat_source", lambda url: _FakeSource())
-    began = time.monotonic()
-    session = main.run_session(URL, max_duration=1.0)
-    elapsed = time.monotonic() - began
-    assert 0.9 <= elapsed < 5.0
-    assert session.status["record"] == "ok"
-
-
-def test_run_session_chat_source_failure_records_video_only(monkeypatch):
-    class QuickRecorder:
-        def __init__(self, session, stop_event):
-            self.stop_event = stop_event
-
-        def run(self):
-            self.stop_event.set()
-
-    def bad(url):
-        raise RuntimeError("sem chat")
-
-    monkeypatch.setattr(main, "Recorder", QuickRecorder)
-    monkeypatch.setattr(main, "make_chat_source", bad)
-    assert main.run_session(URL).status["record"] == "ok"
+    monkeypatch.setattr(main, "check_prerequisites", lambda url=None: None)
+    monkeypatch.setattr(main, "process_session", fake)
+    assert main.main(["--process", str(session.root)]) == 1
 
 
 def test_process_missing_session_returns_1(tmp_path):
     assert main.main(["--process", str(tmp_path / "nao_existe")]) == 1
+
+
+def test_progress_logger_dedups(caplog):
+    plog = main._ProgressLogger()
+    st = engine.JobStatus("a", "u", "twitch", "canal", engine.JobState.WAITING, "Aguardando a live começar")
+    with caplog.at_level(logging.INFO, logger="auto_clipper"):
+        plog(st)
+        plog(st)
+        plog(st)
+    assert len([r for r in caplog.records if r.name == "auto_clipper"]) == 1
 
 
 def test_check_prerequisites_invalid_url():
@@ -232,31 +174,22 @@ def test_check_prerequisites_unknown_engine(monkeypatch):
         main.check_prerequisites(URL)
 
 
+def test_check_prerequisites_runs_hardware_detect(monkeypatch):
+    monkeypatch.setattr(main, "_resolve_ffmpeg_tools", lambda: None)
+    monkeypatch.setattr(config, "WHISPER_ENGINE", "faster")
+    called = []
+    prof = hardware.HardwareProfile("cpu", None, "cpu", "int8", "small", notes=("n",))
+    monkeypatch.setattr(hardware, "detect", lambda force=False: called.append(1) or prof)
+    main.check_prerequisites(URL)
+    assert called
+
+
 def test_main_returns_1_on_prerequisite_error(monkeypatch):
     def fail(url=None):
         raise main.PrerequisiteError("falta algo")
 
     monkeypatch.setattr(main, "check_prerequisites", fail)
     assert main.main(["--url", URL]) == 1
-
-
-def test_monitor_loop_once(monkeypatch, tmp_path):
-    session = Session.create(URL, tmp_path)
-    calls = []
-    monkeypatch.setattr(main, "is_live", lambda url: True)
-    monkeypatch.setattr(main, "run_session", lambda url, max_duration=None: session)
-    monkeypatch.setattr(main, "postprocess", lambda s: calls.append(s) or [])
-    main.monitor_loop(URL, once=True, max_duration=1)
-    assert calls == [session]
-
-
-def test_monitor_loop_invalid_url_exits(monkeypatch):
-    def bad(url):
-        raise main.RecorderError("sem plugin")
-
-    monkeypatch.setattr(main, "is_live", bad)
-    with pytest.raises(SystemExit):
-        main.monitor_loop(URL, once=True)
 
 
 def test_setup_logging_idempotent(tmp_path):

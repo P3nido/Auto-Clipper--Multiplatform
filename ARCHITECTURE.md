@@ -13,7 +13,7 @@ Um processo Python local, sem contas nem chaves de API, que:
 5. **transcreve** cada clipe com o Whisper local e **queima a legenda** no vídeo final.
 
 ```
-                    ┌──────────────── main.py (orquestrador) ────────────────┐
+                    ┌───────── engine.py (orquestrador, 1 por live) ─────────┐
                     │                                                        │
   STREAM_URL ──► is_live()? ──não──► dorme POLL_INTERVAL_S ──┐              │
                     │ sim                                     │              │
@@ -45,7 +45,10 @@ Projeto **plano** (todos os módulos na raiz), como pedido. A única abstração
 ```
 auto-clipper/
 ├── config.py            # ÚNICO arquivo que o usuário edita (URL, multiplicador, modelo Whisper)
-├── main.py              # CLI + loop de monitoramento + orquestração das 5 etapas
+├── main.py              # CLI (fina) sobre o engine
+├── engine.py            # JobManager: N lives em paralelo + fila única de clipes (ADR-008)
+├── hardware.py          # detecção de GPU: NVENC/Quick Sync/AMF/CPU e Whisper CUDA/CPU (ADR-007)
+├── gui.py               # interface gráfica PySide6
 ├── session.py           # Session/RecordingSegment: pastas, manifesto session.json, relógio
 ├── recorder.py          # Etapa 1 — is_live() e Recorder (Streamlink em subprocess)
 ├── chat_listener.py     # Etapa 2 — ChatMessage, porta ChatSource, adaptadores, ChatListener
@@ -87,7 +90,10 @@ Dependências fluem num sentido só: `main → (recorder, chat_listener, hype_de
 | `hype_detector.py` | `Spike`, `bucketize()`, `detect_spike_buckets()`, `find_spikes()` | só `find_spikes` lê disco |
 | `clipper.py` | `ClipSpec`, `plan_clips()`, `build_video_filter()`, `probe_duration()`, `extract_audio()`, `render_clip()`, `cut_clip()`, `ClipperError` | subprocess |
 | `transcriber.py` | `load_model()`, `transcribe_to_srt()`, `format_srt()`, `TranscriberError` | modelo |
-| `main.py` | `main()`, `monitor_loop()`, `run_session()`, `postprocess()` | orquestra |
+| `hardware.py` | `HardwareProfile`, `detect()`, `encoder_args()`, `decoder_args()`, `prepare_cuda_dlls()`, `diagnose()` (ADR-007) | subprocess (testes de encode) |
+| `engine.py` | `JobManager`, `JobStatus`, `JobState`, `record_session()`, `process_session()` (ADR-008) | orquestra N lives + fila de clipes |
+| `main.py` | CLI fina sobre o `engine`: várias `--url`, `--once`, `--process`, `--max-duration`, `--diagnostico` | — |
+| `gui.py` | interface PySide6 sobre o `engine` (ADR-008) | UI |
 
 Os esqueletos `.py` já contêm as assinaturas, dataclasses e docstrings, e eles são o contrato que o subagente `coder` implementa.
 

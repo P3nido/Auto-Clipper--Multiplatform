@@ -9,8 +9,20 @@ import types
 import pytest
 
 import config
+import hardware
 import transcriber
 from transcriber import TranscriberError, format_srt, split_into_cues
+
+
+def _profile(device="cpu", compute="int8", model="small"):
+    return hardware.HardwareProfile("cpu", None, device, compute, model)
+
+
+@pytest.fixture(autouse=True)
+def _cpu_profile(monkeypatch):
+    """Isola os testes do hardware real da máquina."""
+    monkeypatch.setattr(hardware, "detect", lambda force=False: _profile())
+    monkeypatch.setattr(hardware, "prepare_cuda_dlls", lambda: None)
 
 
 def test_basic_block():
@@ -336,3 +348,64 @@ def test_orphan_in_the_middle_is_merged_into_previous():
     assert "né?" not in texts
     assert any(t.endswith("50%, né?") for t in texts)
     assert texts[-1] == "O que eu falei."
+
+
+def test_cuda_load_failure_falls_back_to_cpu(monkeypatch):
+    calls: list = []
+    mod = types.ModuleType("faster_whisper")
+
+    class WhisperModel:
+        def __init__(self, name, device, compute_type):
+            calls.append((name, device, compute_type))
+            if device == "cuda":
+                raise RuntimeError("Library cublas64_12.dll is not found")
+
+    mod.WhisperModel = WhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", mod)
+    monkeypatch.setattr(config, "WHISPER_ENGINE", "faster")
+    monkeypatch.setattr(config, "WHISPER_MODEL", "auto")
+    monkeypatch.setattr(hardware, "detect", lambda force=False: _profile("cuda", "float16", "large-v3-turbo"))
+    model = transcriber.load_model()
+    assert calls == [("large-v3-turbo", "cuda", "float16"), ("small", "cpu", "int8")]
+    assert (model.device, model.compute, model.name) == ("cpu", "int8", "small")
+
+
+def test_cuda_loaded_with_profile_values(monkeypatch):
+    calls: dict = {}
+    monkeypatch.setitem(sys.modules, "faster_whisper", _fake_faster(calls))
+    monkeypatch.setattr(config, "WHISPER_ENGINE", "faster")
+    monkeypatch.setattr(config, "WHISPER_MODEL", "auto")
+    monkeypatch.setattr(hardware, "detect", lambda force=False: _profile("cuda", "float16", "large-v3-turbo"))
+    model = transcriber.load_model()
+    assert calls["init"] == ("large-v3-turbo", "cuda", "float16")
+    assert model.device == "cuda"
+
+
+def test_first_cuda_transcription_failure_falls_back_to_cpu(monkeypatch, tmp_path):
+    inits: list = []
+    mod = types.ModuleType("faster_whisper")
+
+    class WhisperModel:
+        def __init__(self, name, device, compute_type):
+            self.device = device
+            inits.append((name, device, compute_type))
+
+        def transcribe(self, path, **kw):
+            if self.device == "cuda":
+                raise RuntimeError("CUBLAS_STATUS_NOT_SUPPORTED")
+            return iter([types.SimpleNamespace(start=0.0, end=1.0, text="Oi")]), types.SimpleNamespace(
+                language="pt", language_probability=1.0)
+
+    mod.WhisperModel = WhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", mod)
+    monkeypatch.setattr(config, "WHISPER_ENGINE", "faster")
+    monkeypatch.setattr(config, "WHISPER_MODEL", "auto")
+    monkeypatch.setattr(hardware, "detect", lambda force=False: _profile("cuda", "float16", "large-v3-turbo"))
+    model = transcriber.load_model()
+    out = transcriber.transcribe_to_srt(model, tmp_path / "a.wav", tmp_path / "a.srt")
+    assert "Oi" in out.read_text(encoding="utf-8")
+    assert model.device == "cpu"
+    assert inits[-1] == ("small", "cpu", "int8")
+    # a segunda transcrição já usa CPU, sem recarregar
+    transcriber.transcribe_to_srt(model, tmp_path / "a.wav", tmp_path / "b.srt")
+    assert len(inits) == 2

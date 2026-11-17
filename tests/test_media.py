@@ -175,6 +175,46 @@ def test_render_clip_layouts(sample_hd, tmp_path, monkeypatch, layout, expected,
     assert _probe_audio(out)["sample_rate"]  # trilha de áudio presente
 
 
+def test_render_clip_forced_cpu(sample_hd, tmp_path, monkeypatch):
+    import hardware
+
+    monkeypatch.setattr(config, "VIDEO_ENCODER", "cpu")
+    monkeypatch.setattr(hardware, "_cached", None)
+    try:
+        profile = hardware.detect()
+        assert (profile.video_encoder, profile.hw_decode) == ("cpu", None)
+        out = clipper.render_clip(sample_hd, ClipSpec(0, 0.5, 2.0, 10), tmp_path / "cpu.mp4", _srt(tmp_path / "s.srt"))
+        assert _probe_video(out)["height"] == "1920"
+    finally:
+        hardware._cached = None
+
+
+def test_render_clip_gpu_failure_falls_back_to_cpu(sample_hd, tmp_path, monkeypatch, caplog):
+    import hardware
+
+    # perfil com encoder inexistente e hwaccel inválido: o 1o encode falha, o 2o (CPU) funciona
+    broken = hardware.HardwareProfile("nvenc", "cuda", "cpu", "int8", "small")
+    monkeypatch.setattr(hardware, "detect", lambda force=False: broken)
+    monkeypatch.setattr(
+        hardware, "encoder_args",
+        lambda p: ["-c:v", "encoder_que_nao_existe"] if p.video_encoder == "nvenc"
+        else ["-c:v", "libx264", "-crf", "30", "-preset", "ultrafast"],
+    )
+    with caplog.at_level("WARNING", logger="clipper"):
+        out = clipper.render_clip(sample_hd, ClipSpec(0, 0.5, 2.0, 10), tmp_path / "fb.mp4")
+    assert out.exists() and out.stat().st_size > 0
+    assert any("refazendo" in r.message for r in caplog.records)
+
+
+def test_render_clip_gpu_and_cpu_both_fail_raises(sample_hd, tmp_path, monkeypatch):
+    import hardware
+
+    monkeypatch.setattr(hardware, "detect", lambda force=False: hardware.HardwareProfile("cpu", None, "cpu", "int8", "small"))
+    monkeypatch.setattr(hardware, "encoder_args", lambda p: ["-c:v", "encoder_que_nao_existe"])
+    with pytest.raises(ClipperError):
+        clipper.render_clip(sample_hd, ClipSpec(0, 0.5, 2.0, 10), tmp_path / "x.mp4")
+
+
 def test_render_clip_keeps_fps_when_none(sample_hd, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "OUTPUT_LAYOUT", "horizontal")
     monkeypatch.setattr(config, "OUTPUT_FPS", None)

@@ -11,7 +11,7 @@ Projeto Python **local e gratuito** (sem contas, tokens ou chaves de API) que gr
 ## Convenções
 - Layout **plano**: os módulos ficam na raiz e os imports são absolutos (`import config`, `from session import Session`). Não crie pacotes ou subpastas de código sem um ADR.
 - Cada módulo declara `__all__`. Assinaturas públicas são contrato: para mudar uma, atualize o ARCHITECTURE.md §3 e os testes junto.
-- Os módulos de etapa não importam uns aos outros (exceto `clipper` importar o tipo `Spike`). Quem orquestra é o `main.py`.
+- Os módulos de etapa não importam uns aos outros (exceto `clipper` importar o tipo `Spike`). Quem orquestra é o `engine.py` (JobManager); `main.py` (CLI) e `gui.py` (interface) são clientes dele.
 - Toda configuração fica em `config.py`. Não use valores mágicos no código.
 - Use `logging` e não `print`. Subprocess sempre com lista de argumentos, nunca `shell=True`.
 - Relógio único: `session.now()`. Conversão de tempo do chat para tempo do vídeo: só via `RecordingSegment.wall_to_offset()`.

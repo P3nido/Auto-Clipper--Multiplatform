@@ -189,8 +189,11 @@ class Recorder:
         except FileNotFoundError as exc:
             raise RecorderError(f"Não foi possível executar o streamlink: {exc}") from exc
 
+        # O nome deriva da thread que grava (ex.: "job-ab12cd-recorder-streamlink"): o
+        # filtro de log por live (engine.py) reconhece o prefixo "job-<id>".
         reader = threading.Thread(
-            target=self._read_output, args=(proc, segment), name="streamlink-reader", daemon=True
+            target=self._read_output, args=(proc, segment),
+            name=f"{threading.current_thread().name}-streamlink", daemon=True,
         )
         reader.start()
         try:

@@ -15,9 +15,10 @@ STREAM_URL = "https://www.twitch.tv/NOME_DO_CANAL"
 # Um bloco de 10 s vira "pico" quando tem X vezes mais mensagens que a média recente.
 SPIKE_MULTIPLIER = 3.0
 
-# Modelo do Whisper: "tiny", "base", "small", "medium", "large-v3".
-# Quanto maior, melhor a legenda e mais lento. Em CPU, "small" é um bom equilíbrio.
-WHISPER_MODEL = "small"
+# Modelo do Whisper: "auto" (large-v3-turbo na GPU NVIDIA, small na CPU) ou
+# "tiny", "base", "small", "medium", "large-v3-turbo", "large-v3".
+# Quanto maior, melhor a legenda e mais lento.
+WHISPER_MODEL = "auto"
 
 
 # ═══════════════════════════════ AVANÇADO ═══════════════════════════════
@@ -63,7 +64,7 @@ AUDIO_BITRATE = "160k"          # áudio AAC dos clipes
 
 # --- Etapa 5: transcrição e legenda -------------------------------------
 WHISPER_ENGINE = "faster"       # "faster" (faster-whisper, ~4x mais rápido em CPU) ou "openai" (ADR-005)
-WHISPER_COMPUTE_TYPE = "int8"   # faster-whisper em CPU: "int8" (rápido) ou "float32" (mais preciso, mais lento)
+WHISPER_COMPUTE_TYPE = "auto"   # "auto" | "float16" (GPU) | "int8" (CPU) | "float32"
 WHISPER_VAD = True              # faster-whisper: pula trechos sem fala (música, silêncio)
 # Legendas curtas, estilo redes sociais: cada bloco na tela tem no máximo
 # SUBTITLE_MAX_CHARS caracteres (~2 linhas no vertical) e SUBTITLE_MAX_CUE_S segundos.
@@ -85,6 +86,18 @@ SUBTITLE_STYLE_VERTICAL = (
     "OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=0,"
     "Alignment=2,MarginV=60,MarginL=21,MarginR=21"
 )
+
+# --- Hardware / GPU (ADR-007) -------------------------------------------
+# "auto" detecta e testa o hardware na inicialização (veja: python main.py --diagnostico)
+VIDEO_ENCODER = "auto"          # "auto" | "nvenc" (NVIDIA) | "qsv" (Intel) | "amf" (AMD) | "cpu"
+HW_DECODE = "auto"              # "auto" | "cuda" | "d3d11va" | "qsv" | "none"
+WHISPER_DEVICE = "auto"         # "auto" | "cuda" | "cpu"
+# (WHISPER_MODEL e WHISPER_COMPUTE_TYPE também aceitam "auto": large-v3-turbo/float16
+#  na GPU NVIDIA, small/int8 na CPU)
+
+# --- Várias lives (ADR-008) ---------------------------------------------
+MAX_PARALLEL_LIVES = 4          # lives gravando/monitorando ao mesmo tempo
+POSTPROCESS_WORKERS = 1         # clipes gerados um de cada vez (não disputar a GPU)
 
 # --- Saída --------------------------------------------------------------
 SESSIONS_DIR = "sessions"

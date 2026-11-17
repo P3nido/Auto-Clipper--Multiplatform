@@ -4,9 +4,12 @@ Uso:
     python main.py                      # monitora STREAM_URL para sempre
     python main.py --once               # sai depois de processar uma live
     python main.py --url <URL>          # sobrescreve STREAM_URL
+    python main.py --url <A> --url <B>  # várias lives ao mesmo tempo
     python main.py --process <pasta>    # refaz só o pós-processamento de uma sessão
     python main.py --max-duration 120   # limita a gravação a N segundos
+    python main.py --diagnostico        # mostra a GPU/encoder/Whisper que serão usados
 
+A lógica de gravação e de clipes mora no engine.py; aqui fica só a CLI.
 Pré-requisitos: ver README.md (FFmpeg no PATH; Chrome para Kick).
 """
 from __future__ import annotations
@@ -17,43 +20,33 @@ import logging
 import os
 import shutil
 import sys
-import threading
 import time
 from pathlib import Path
 
 import config
-from chat_listener import ChatListener, detect_platform, make_chat_source
-from clipper import ClipperError, extract_audio, plan_clips, probe_duration, render_clip
-from hype_detector import find_spikes
-from recorder import Recorder, RecorderError, is_live
+import hardware
+from chat_listener import detect_platform
+from engine import (_LOG_FORMAT, JobManager, JobState, JobStatus, _fmt_duration, _fmt_size,
+                    _LogFormatter, process_session)
 from session import Session
-from transcriber import load_model, transcribe_to_srt
 
 __all__ = [
-    "PrerequisiteError", "main", "monitor_loop", "run_session", "postprocess",
-    "setup_logging", "check_prerequisites",
+    "PrerequisiteError", "main", "run_jobs", "setup_logging", "check_prerequisites",
 ]
 
 logger = logging.getLogger("auto_clipper")
 
-_LOG_FORMAT = "%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s"
 _HANDLER_TAG = "_auto_clipper_handler"
 _POLL_SLICE_S = 0.5
-_RECORDER_JOIN_S = 15.0
-_CHAT_JOIN_S = 10.0
+_RECORDING_LOG_INTERVAL_S = 30.0   # a mensagem "Gravando há ..." muda a cada 2 s; loga só a cada 30 s
+_TERMINAL = (JobState.DONE, JobState.STOPPED, JobState.ERROR)
 
 
 class PrerequisiteError(RuntimeError):
     """Pré-requisito ausente (ffmpeg, streamlink, whisper) ou URL não suportada."""
 
 
-class _Formatter(logging.Formatter):
-    """O streamlink renomeia os níveis globais para minúsculo ao ser importado;
-    normaliza para que o run.log fique consistente (INFO, WARNING, ERROR)."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        record.levelname = record.levelname.upper()
-        return super().format(record)
+_Formatter = _LogFormatter
 
 
 def _tagged(handler: logging.Handler, kind: str) -> logging.Handler:
@@ -62,9 +55,10 @@ def _tagged(handler: logging.Handler, kind: str) -> logging.Handler:
 
 
 def setup_logging(log_file: Path | None = None) -> None:
-    """Console + (opcional) arquivo da sessão, no nível config.LOG_LEVEL.
+    """Console + (opcional) arquivo global, no nível config.LOG_LEVEL.
 
-    Idempotente: o handler de console é criado uma vez e o de arquivo é trocado."""
+    Idempotente: o handler de console é criado uma vez e o de arquivo é trocado.
+    O run.log de cada live é gerenciado pelo engine (um handler por sessão)."""
     root = logging.getLogger()
     root.setLevel(getattr(logging, str(config.LOG_LEVEL).upper(), logging.INFO))
     formatter = _Formatter(_LOG_FORMAT)
@@ -123,7 +117,8 @@ def _resolve_ffmpeg_tools() -> None:
 
 def check_prerequisites(url: str | None = None) -> None:
     """Falha cedo (PrerequisiteError) se ffmpeg/ffprobe/streamlink/whisper não
-    estiverem disponíveis ou se a URL não for de uma plataforma suportada."""
+    estiverem disponíveis ou se a URL não for de uma plataforma suportada.
+    Também detecta o hardware (GPU) e registra o perfil escolhido no log."""
     _resolve_ffmpeg_tools()
     if importlib.util.find_spec("streamlink") is None:
         raise PrerequisiteError("streamlink não instalado. Rode: pip install streamlink")
@@ -143,187 +138,102 @@ def check_prerequisites(url: str | None = None) -> None:
         raise PrerequisiteError(
             f"WHISPER_ENGINE desconhecido: {engine!r} (use 'faster' ou 'openai')"
         )
+    # Detecta (e cacheia) o hardware cedo: o perfil aparece no log antes de gravar.
+    profile = hardware.detect()
+    for note in profile.notes:
+        logger.info("Hardware: %s", note)
 
 
-def run_session(url: str, *, max_duration: float | None = None) -> Session:
-    """Grava UMA live: cria a Session, inicia as threads Recorder e ChatListener
-    com um stop_event compartilhado, espera o Recorder terminar e faz join no chat
-    (timeout 10 s). Ctrl+C: seta stop_event e retorna a sessão mesmo assim.
-    max_duration: para a gravação após N segundos."""
-    session = Session.create(url, Path(config.SESSIONS_DIR))
-    setup_logging(session.log_path)
-    logger.info("Sessão iniciada em %s", session.root)
-    stop_event = threading.Event()
+class _ProgressLogger:
+    """Loga o andamento dos jobs sem spam: só quando o estado ou a mensagem mudam
+    (e, durante a gravação, no máximo a cada _RECORDING_LOG_INTERVAL_S)."""
 
-    recorder = Recorder(session, stop_event)
-    rec_thread = threading.Thread(target=recorder.run, name="recorder", daemon=True)
+    def __init__(self) -> None:
+        self._last: dict[str, tuple[JobState, str, float]] = {}
 
-    listener: ChatListener | None = None
-    chat_thread: threading.Thread | None = None
-    try:
-        source = make_chat_source(url)
-        listener = ChatListener(session, source, stop_event)
-        chat_thread = threading.Thread(target=listener.run, name="chat", daemon=True)
-    except Exception:  # noqa: BLE001 - sem chat ainda dá para gravar o vídeo
-        logger.exception("Não foi possível criar a fonte de chat; gravando só o vídeo")
-
-    interrupted = False
-    started = time.monotonic()
-    rec_thread.start()
-    if chat_thread is not None:
-        chat_thread.start()
-    try:
-        while rec_thread.is_alive():
-            rec_thread.join(_POLL_SLICE_S)
-            if max_duration is not None and time.monotonic() - started >= max_duration:
-                logger.info("max-duration de %.1f s atingido; encerrando", max_duration)
-                break
-    except KeyboardInterrupt:
-        interrupted = True
-        logger.info("interrompido pelo usuário")
-
-    stop_event.set()
-    try:
-        rec_thread.join(_RECORDER_JOIN_S)
-        if chat_thread is not None:
-            chat_thread.join(_CHAT_JOIN_S)
-    except KeyboardInterrupt:
-        interrupted = True
-        logger.info("interrompido pelo usuário durante o encerramento")
-    if rec_thread.is_alive():
-        logger.warning("Recorder não encerrou em %.0f s", _RECORDER_JOIN_S)
-
-    session.status["record"] = "interrompido" if interrupted else "ok"
-    session.save()
-    total_bytes = sum(seg.path.stat().st_size for seg in session.segments if seg.path.exists())
-    logger.info(
-        "Gravação encerrada: %d segmento(s), %d bytes, %d mensagens de chat, %d reconexões",
-        len(session.segments), total_bytes,
-        listener.message_count if listener else 0,
-        listener.reconnect_count if listener else 0,
-    )
-    return session
-
-
-def _clip_name(index: int, segment_index: int, start_s: float) -> str:
-    total = int(start_s)
-    return f"clip_{index:02d}_seg{segment_index}_{total // 60:02d}m{total % 60:02d}s"
-
-
-def postprocess(session: Session) -> list[Path]:
-    """Etapas 3 a 5 em sequência. Cada clipe é isolado: a falha de um não para os
-    outros. Atualiza session.status. Retorna os caminhos em final/."""
-    setup_logging(session.log_path)
-    spikes = find_spikes(session)
-
-    durations: dict[int, float] = {}
-    sources: dict[int, Path] = {}
-    for seg in session.segments:
-        try:
-            if not seg.path.exists() or seg.path.stat().st_size <= 0:
-                logger.warning("Segmento %d ausente ou vazio; ignorado", seg.index)
-                continue
-            durations[seg.index] = probe_duration(seg.path)
-            sources[seg.index] = seg.path
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Segmento %d: não foi possível medir a duração (%s); ignorado", seg.index, exc)
-
-    specs = plan_clips(
-        spikes, durations,
-        pre_s=config.CLIP_PRE_S, post_s=config.CLIP_POST_S, max_clips=config.MAX_CLIPS,
-    )
-    if not specs:
-        logger.info("Nenhum clipe a gerar (%d pico(s))", len(spikes))
-        session.status["postprocess"] = "ok: 0/0 clipes"
-        session.save()
-        return []
-
-    try:
-        model = load_model()
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Falha ao carregar o modelo Whisper")
-        session.status["postprocess"] = f"erro: {exc}"
-        session.save()
-        return []
-
-    finals: list[Path] = []
-    total = len(specs)
-    for i, spec in enumerate(specs, start=1):
-        began = time.monotonic()
-        name = _clip_name(i, spec.segment_index, spec.start_s)
-        src = sources[spec.segment_index]
-        wav = session.clips_dir / f"{name}.wav"
-        try:
-            srt: Path | None = None
-            try:
-                extract_audio(src, spec, wav)
-            except ClipperError as exc:
-                logger.warning("clipe %s sem áudio utilizável (%s); renderizando sem legenda", name, exc)
-            else:
-                srt = transcribe_to_srt(model, wav, session.subs_dir / f"{name}.srt")
-            final = render_clip(src, spec, session.final_dir / f"{name}.mp4", srt)
-        except Exception:  # noqa: BLE001 - um clipe ruim não derruba os outros
-            logger.exception("clipe %d/%d falhou (%s)", i, total, name)
-            continue
-        finally:
-            wav.unlink(missing_ok=True)
-        finals.append(final)
-        logger.info("clipe %d/%d pronto (%.1f s)", i, total, time.monotonic() - began)
-
-    done = len(finals)
-    outcome = "ok" if done == total else ("parcial" if done else "erro")
-    session.status["postprocess"] = f"{outcome}: {done}/{total} clipes"
-    if config.DELETE_RAW_AFTER_PROCESS and len(finals) == total:
-        for path in sources.values():
-            try:
-                path.unlink()
-                logger.info("Gravação bruta apagada: %s", path)
-            except OSError as exc:
-                logger.warning("Não foi possível apagar %s: %s", path, exc)
-    session.save()
-    return finals
-
-
-def _sleep_interruptible(seconds: float) -> None:
-    deadline = time.monotonic() + seconds
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        time.sleep(min(_POLL_SLICE_S, remaining))
-
-
-def monitor_loop(url: str, once: bool = False, max_duration: float | None = None) -> None:
-    """A cada POLL_INTERVAL_S: is_live? -> run_session -> postprocess."""
-    try:
-        while True:
-            try:
-                live = is_live(url)
-            except RecorderError as exc:
-                logger.error("%s", exc)
-                raise SystemExit(1) from exc
-            if live:
-                session = run_session(url, max_duration=max_duration)
-                postprocess(session)
-                if once:
+    def __call__(self, status: JobStatus) -> None:
+        last = self._last.get(status.job_id)
+        stamp = time.monotonic()
+        recording = status.state == JobState.RECORDING
+        if last is not None:
+            if recording and last[0] == JobState.RECORDING:
+                if stamp - last[2] < _RECORDING_LOG_INTERVAL_S:
                     return
-                logger.info("aguardando próxima live")
-            else:
-                logger.info("Canal offline; nova checagem em %s s", config.POLL_INTERVAL_S)
-            _sleep_interruptible(config.POLL_INTERVAL_S)
-    except KeyboardInterrupt:
-        logger.info("interrompido pelo usuário; saindo")
+            elif last[0] == status.state and last[1] == status.message:
+                return
+        self._last[status.job_id] = (status.state, status.message, stamp)
+        level = logging.ERROR if status.state == JobState.ERROR else logging.INFO
+        line = status.message
+        if recording and status.recorded_bytes:
+            line += (f" ({_fmt_duration(status.recorded_s)}, {_fmt_size(status.recorded_bytes)}, "
+                     f"{status.chat_messages} msgs)")
+        logger.log(level, "[%s] %s: %s", status.channel, status.state.value, line)
+
+
+def run_jobs(urls: list[str], *, once: bool, max_duration: float | None = None) -> int:
+    """Cria um job por URL e espera todos terminarem. Ctrl+C: para todos (a gravação
+    em andamento segue para a fila de clipes) e espera a fila; um segundo Ctrl+C
+    encerra de vez. Retorna o código de saída (1 se algum job terminou em erro)."""
+    manager = JobManager(on_update=_ProgressLogger())
+    job_ids: list[str] = []
+
+    def running() -> bool:
+        return any(manager.status(j).state not in _TERMINAL for j in job_ids)
+
+    try:
+        for url in urls:
+            try:
+                job_ids.append(manager.add(url, once=once, max_duration=max_duration))
+            except (ValueError, RuntimeError) as exc:
+                logger.error("%s", exc)
+                for job_id in job_ids:
+                    manager.stop(job_id)
+                return 1
+        try:
+            while running():
+                time.sleep(_POLL_SLICE_S)
+        except KeyboardInterrupt:
+            logger.info(
+                "interrompido pelo usuário; finalizando gravações e clipes "
+                "(Ctrl+C de novo para sair já)"
+            )
+            for job_id in job_ids:
+                manager.stop(job_id)
+            try:
+                while running():
+                    time.sleep(_POLL_SLICE_S)
+            except KeyboardInterrupt:
+                logger.info(
+                    "saindo; as gravações brutas ficam em %s (use --process)", config.SESSIONS_DIR
+                )
+    finally:
+        manager.shutdown(wait=True)
+    failed = any(manager.status(j).state == JobState.ERROR for j in job_ids)
+    return 1 if failed else 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Auto-Clipper Multiplataforma")
-    parser.add_argument("--url", default=config.STREAM_URL, help="URL do canal (Twitch, YouTube ou Kick)")
+    parser.add_argument("--url", action="append", default=None,
+                        help="URL do canal (Twitch, YouTube ou Kick); repita para várias lives")
     parser.add_argument("--once", action="store_true", help="sai depois de processar uma live")
     parser.add_argument("--process", type=Path, metavar="PASTA", help="refaz o pós-processamento de uma sessão")
     parser.add_argument("--max-duration", type=float, default=None, metavar="SEGUNDOS",
                         help="para a gravação após N segundos")
+    parser.add_argument("--diagnostico", action="store_true",
+                        help="mostra o hardware detectado (GPU/encoder/Whisper) e um mini benchmark")
     args = parser.parse_args(argv)
+    urls: list[str] = args.url or [config.STREAM_URL]
     setup_logging()
+
+    if args.diagnostico:
+        try:
+            _resolve_ffmpeg_tools()
+        except PrerequisiteError as exc:
+            logger.error("%s", exc)
+            return 1
+        print(hardware.diagnose())  # única exceção ao "sem print": é a saída do comando
+        return 0
 
     try:
         if args.process is not None:
@@ -333,20 +243,17 @@ def main(argv: list[str] | None = None) -> int:
                 logger.error("Não foi possível carregar a sessão %s: %s", args.process, exc)
                 return 1
             check_prerequisites(session.url)
-            finals = postprocess(session)
+            finals = process_session(session)
             for path in finals:
                 logger.info("Clipe final: %s", path)
             logger.info("%d clipe(s) final(is) em %s", len(finals), session.final_dir)
             return 1 if session.status.get("postprocess", "").startswith("erro") else 0
-        check_prerequisites(args.url)
+        for url in urls:
+            check_prerequisites(url)
     except PrerequisiteError as exc:
         logger.error("%s", exc)
         return 1
-    try:
-        monitor_loop(args.url, once=args.once, max_duration=args.max_duration)
-    except SystemExit as exc:
-        return int(exc.code) if isinstance(exc.code, int) else 1
-    return 0
+    return run_jobs(urls, once=args.once, max_duration=args.max_duration)
 
 
 if __name__ == "__main__":

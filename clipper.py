@@ -9,10 +9,11 @@ import shutil
 import subprocess
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import config
+import hardware
 from hype_detector import Spike
 
 __all__ = [
@@ -228,10 +229,6 @@ def render_clip(source: Path, spec: ClipSpec, out_path: Path, srt_path: Path | N
             logger.info("SRT vazio ou ausente; renderizando %s sem legenda", out_abs.name)
 
     tmp_srt: Path | None = None
-    cmd = [
-        config.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
-        "-ss", f"{spec.start_s:.3f}", "-i", str(src_abs), "-t", f"{spec.duration_s:.3f}",
-    ]
     cwd: str | None = None
     srt_name: str | None = None
     layout = config.OUTPUT_LAYOUT
@@ -246,20 +243,41 @@ def render_clip(source: Path, spec: ClipSpec, out_path: Path, srt_path: Path | N
     graph = build_video_filter(
         layout, srt_name, size=tuple(config.VERTICAL_SIZE), fps=config.OUTPUT_FPS, style=style,
     )
-    cmd += ["-filter_complex", graph, "-map", "[v]", "-map", "0:a:0?"]
-    cmd += [
-        "-c:v", "libx264", "-crf", str(config.VIDEO_CRF), "-preset", config.VIDEO_PRESET,
-        "-c:a", "aac", "-b:a", config.AUDIO_BITRATE, "-movflags", "+faststart", str(out_abs),
-    ]
+
+    def build_cmd(profile: hardware.HardwareProfile) -> list[str]:
+        cmd = [config.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y"]
+        cmd += hardware.decoder_args(profile)
+        cmd += ["-ss", f"{spec.start_s:.3f}", "-i", str(src_abs), "-t", f"{spec.duration_s:.3f}"]
+        cmd += ["-filter_complex", graph, "-map", "[v]", "-map", "0:a:0?"]
+        cmd += hardware.encoder_args(profile)
+        cmd += ["-c:a", "aac", "-b:a", config.AUDIO_BITRATE, "-movflags", "+faststart", str(out_abs)]
+        return cmd
+
+    def failure(proc: subprocess.CompletedProcess[str]) -> str | None:
+        """None se o render deu certo; senão a descrição do problema."""
+        if proc.returncode != 0:
+            return f"ffmpeg falhou ao renderizar {src_abs}: {_tail(proc.stderr)}"
+        if not out_abs.exists() or out_abs.stat().st_size == 0:
+            return f"ffmpeg não gerou saída válida em {out_abs}: {_tail(proc.stderr)}"
+        return None
+
+    profile = hardware.detect()
     try:
-        proc = _run(cmd, cwd=cwd)
+        proc = _run(build_cmd(profile), cwd=cwd)
+        problem = failure(proc)
+        if problem is not None and (profile.video_encoder != "cpu" or profile.hw_decode):
+            logger.warning(
+                "Render com GPU (%s, decode %s) falhou; refazendo %s na CPU. Motivo: %s",
+                profile.video_encoder, profile.hw_decode or "CPU", out_abs.name, problem,
+            )
+            cpu_profile = replace(profile, video_encoder="cpu", hw_decode=None)
+            proc = _run(build_cmd(cpu_profile), cwd=cwd)
+            problem = failure(proc)
     finally:
         if tmp_srt is not None:
             tmp_srt.unlink(missing_ok=True)
-    if proc.returncode != 0:
-        raise ClipperError(f"ffmpeg falhou ao renderizar {src_abs}: {_tail(proc.stderr)}")
-    if not out_abs.exists() or out_abs.stat().st_size == 0:
-        raise ClipperError(f"ffmpeg não gerou saída válida em {out_abs}: {_tail(proc.stderr)}")
+    if problem is not None:
+        raise ClipperError(problem)
     return out_abs
 
 

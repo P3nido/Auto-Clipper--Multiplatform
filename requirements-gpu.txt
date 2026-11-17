@@ -1,0 +1,5 @@
+# Aceleração do Whisper em GPU NVIDIA (opcional, ~1 GB). Necessário para
+# WHISPER_DEVICE = "cuda"/"auto" usar a placa. RTX série 50 exige CUDA 12.8+ (ADR-007).
+-r requirements.txt
+nvidia-cublas-cu12>=12.8
+nvidia-cudnn-cu12>=9,<10
