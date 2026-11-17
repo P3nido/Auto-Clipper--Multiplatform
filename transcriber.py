@@ -7,13 +7,21 @@ de transcrição (ADR-005). A legenda é queimada por clipper.render_clip
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import config
 
-__all__ = ["TranscriberError", "load_model", "transcribe_to_srt", "format_srt"]
+__all__ = ["TranscriberError", "load_model", "transcribe_to_srt", "format_srt", "split_into_cues"]
+
+_CUE_PAUSE_S = 0.8  # pausa entre palavras que força nova legenda
+_CUE_MIN_DURATION_S = 0.3
+_CUE_COMMA_FILL_RATIO = 0.6  # vírgula só quebra com o bloco já >= 60% de max_chars
+_CUE_ORPHAN_MAX_CHARS = 3
+_CUE_ORPHAN_TOLERANCE = 8
+_SENTENCE_END = (".", "!", "?", "…")
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +111,82 @@ def format_srt(segments: list[dict[str, Any]]) -> str:
     return "\n".join(blocks)
 
 
+def _valid_time(value: Any) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(value)
+
+
+def split_into_cues(words: list[dict[str, Any]], *, max_chars: int, max_duration: float) -> list[dict[str, Any]]:
+    """PURA: palavras [{"start","end","word"}] -> blocos curtos [{"start","end","text"}]
+    para format_srt. Guloso: quebra por tamanho, duração, pausa e fim de frase."""
+    clean: list[tuple[float, float, str]] = []
+    for w in words:
+        text = " ".join(str(w.get("word", "")).split())
+        start, end = w.get("start"), w.get("end")
+        if not text or not _valid_time(start) or not _valid_time(end) or end < start:
+            continue
+        clean.append((float(start), float(end), text))
+
+    blocks: list[list[tuple[float, float, str]]] = []
+    cur: list[tuple[float, float, str]] = []
+    cur_len = 0
+    for start, end, text in clean:
+        if cur:
+            if (
+                cur_len + 1 + len(text) > max_chars
+                or end - cur[0][0] > max_duration
+                or start - cur[-1][1] > _CUE_PAUSE_S
+            ):
+                blocks.append(cur)
+                cur, cur_len = [], 0
+        cur_len = cur_len + 1 + len(text) if cur else len(text)
+        cur.append((start, end, text))
+        if text.endswith(_SENTENCE_END) or (
+            text.endswith(",") and cur_len >= _CUE_COMMA_FILL_RATIO * max_chars
+        ):
+            blocks.append(cur)
+            cur, cur_len = [], 0
+    if cur:
+        blocks.append(cur)
+
+    # bloco órfão (1 palavra curta, ex. "né?") em QUALQUER posição é juntado ao
+    # anterior se couber e não vier depois de uma pausa: evita legenda-relâmpago.
+    merged: list[list[tuple[float, float, str]]] = []
+    for block in blocks:
+        if (
+            merged
+            and len(block) == 1
+            and len(block[0][2]) <= _CUE_ORPHAN_MAX_CHARS
+            and block[0][0] - merged[-1][-1][1] <= _CUE_PAUSE_S
+            and len(" ".join(t for _, _, t in merged[-1])) + 1 + len(block[0][2])
+            <= max_chars + _CUE_ORPHAN_TOLERANCE
+        ):
+            merged[-1].extend(block)
+        else:
+            merged.append(block)
+    blocks = merged
+
+    cues: list[dict[str, Any]] = [
+        {"start": b[0][0], "end": b[-1][1], "text": " ".join(t for _, _, t in b)} for b in blocks
+    ]
+    for i, cue in enumerate(cues):
+        cue["end"] = max(cue["end"], cue["start"] + _CUE_MIN_DURATION_S)
+        if i + 1 < len(cues):
+            cue["end"] = min(cue["end"], cues[i + 1]["start"])
+    return cues
+
+
+def _norm_words(raw: Any) -> list[dict[str, Any]]:
+    """Normaliza palavras (objetos do faster-whisper ou dicts do openai) para dicts."""
+    out: list[dict[str, Any]] = []
+    for w in raw or []:
+        if isinstance(w, dict):
+            out.append({"start": w.get("start"), "end": w.get("end"), "word": w.get("word", "")})
+        else:
+            out.append({"start": getattr(w, "start", None), "end": getattr(w, "end", None),
+                        "word": getattr(w, "word", "")})
+    return out
+
+
 def transcribe_to_srt(model: Any, media_path: Path, out_srt: Path, language: str | None = None) -> Path:
     """Transcreve áudio/vídeo e grava o SRT em UTF-8. Sem fala = SRT vazio (não é erro).
     language None -> config.WHISPER_LANGUAGE (None = detecção automática)."""
@@ -113,18 +197,31 @@ def transcribe_to_srt(model: Any, media_path: Path, out_srt: Path, language: str
         if model.engine == "faster":
             audio = _read_wav_16k_mono(media_path)
             segments, info = model.impl.transcribe(
-                audio if audio is not None else str(media_path), language=lang, vad_filter=config.WHISPER_VAD, beam_size=5
+                audio if audio is not None else str(media_path), language=lang, vad_filter=config.WHISPER_VAD, beam_size=5,
+                word_timestamps=True,
             )
             # o gerador é lazy: precisa ser consumido dentro do try
-            items = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
+            items = []
+            words: list[dict[str, Any]] = []
+            for s in segments:
+                items.append({"start": s.start, "end": s.end, "text": s.text})
+                words.extend(_norm_words(getattr(s, "words", None)))
             logger.debug(
                 "idioma detectado: %s (p=%.2f)",
                 getattr(info, "language", None),
                 float(getattr(info, "language_probability", 0.0) or 0.0),
             )
         else:
-            result = model.impl.transcribe(str(media_path), language=lang, fp16=False, verbose=None)
+            result = model.impl.transcribe(str(media_path), language=lang, fp16=False, verbose=None,
+                                         word_timestamps=True)
             items = result.get("segments", [])
+            words = []
+            for seg in items:
+                words.extend(_norm_words(seg.get("words")))
+        if config.SUBTITLE_MAX_CHARS > 0 and words:
+            items = split_into_cues(
+                words, max_chars=config.SUBTITLE_MAX_CHARS, max_duration=config.SUBTITLE_MAX_CUE_S
+            )
         srt = format_srt(items)
     except Exception as exc:
         raise TranscriberError(f"falha ao transcrever {media_path}: {exc}") from exc

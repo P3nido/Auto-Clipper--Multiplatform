@@ -65,6 +65,11 @@ AUDIO_BITRATE = "160k"          # áudio AAC dos clipes
 WHISPER_ENGINE = "faster"       # "faster" (faster-whisper, ~4x mais rápido em CPU) ou "openai" (ADR-005)
 WHISPER_COMPUTE_TYPE = "int8"   # faster-whisper em CPU: "int8" (rápido) ou "float32" (mais preciso, mais lento)
 WHISPER_VAD = True              # faster-whisper: pula trechos sem fala (música, silêncio)
+# Legendas curtas, estilo redes sociais: cada bloco na tela tem no máximo
+# SUBTITLE_MAX_CHARS caracteres (~2 linhas no vertical) e SUBTITLE_MAX_CUE_S segundos.
+# Usa o tempo de cada palavra do Whisper; 0 desativa (volta às frases inteiras).
+SUBTITLE_MAX_CHARS = 40
+SUBTITLE_MAX_CUE_S = 3.0
 WHISPER_LANGUAGE: str | None = "pt"  # None = detecta o idioma automaticamente (lives em outras línguas)
 SUBTITLE_STYLE = (
     "FontName=Arial,FontSize=16,Bold=1,PrimaryColour=&H00FFFFFF,"

@@ -10,7 +10,7 @@ import pytest
 
 import config
 import transcriber
-from transcriber import TranscriberError, format_srt
+from transcriber import TranscriberError, format_srt, split_into_cues
 
 
 def test_basic_block():
@@ -164,6 +164,145 @@ def test_import_error(monkeypatch, engine, module, hint):
         transcriber.load_model()
 
 
+def _words(text, t0=0.0, step=0.4, gap=0.0):
+    out, t = [], t0
+    for w in text.split():
+        out.append({"start": t, "end": t + step, "word": " " + w})
+        t += step + gap
+    return out
+
+
+def _cues(words, max_chars=40, max_duration=3.0):
+    return split_into_cues(words, max_chars=max_chars, max_duration=max_duration)
+
+
+def test_cues_empty():
+    assert _cues([]) == []
+
+
+def test_cues_long_sentence_without_punctuation():
+    text = " ".join(["palavra"] * 25)
+    cues = _cues(_words(text))
+    assert len(cues) > 3
+    assert all(len(c["text"]) <= 40 for c in cues)
+    assert all(c["end"] - c["start"] <= 3.0 + 1e-9 for c in cues)
+    assert " ".join(c["text"] for c in cues) == text
+
+
+def test_cues_sentence_end_breaks():
+    cues = _cues(_words("oi mano. tudo bem? sim senhor"))
+    assert [c["text"] for c in cues] == ["oi mano.", "tudo bem?", "sim senhor"]
+
+
+def test_cues_comma_breaks_only_when_60_percent_full():
+    short = _cues(_words("oi, mano beleza"))
+    assert [c["text"] for c in short] == ["oi, mano beleza"]
+    long = _cues(_words("aquele cara jogou muito, mano beleza"), max_chars=40)  # 24 chars >= 24
+    assert long[0]["text"] == "aquele cara jogou muito,"
+    assert long[1]["text"] == "mano beleza"
+
+
+def test_cues_pause_breaks():
+    words = _words("um dois") + _words("tres quatro", t0=5.0)
+    assert [c["text"] for c in _cues(words)] == ["um dois", "tres quatro"]
+
+
+def test_cues_giant_word_alone():
+    giant = "a" * 60
+    cues = _cues(_words(f"oi {giant} fim"))
+    assert [c["text"] for c in cues] == ["oi", giant, "fim"]
+
+
+def test_cues_orphan_merged():
+    cues = _cues(_words("isso foi muito bom, né?"), max_chars=15)
+    assert cues[-1]["text"].endswith("né?")
+    assert len(cues[-1]["text"].split()) > 1
+    # sem tolerância possível, o órfão fica sozinho
+    far = _cues(_words("a" * 20 + " " + "né?"), max_chars=15)
+    assert far[-1]["text"] == "né?"
+
+
+def test_cues_no_overlap_and_positive_duration():
+    words = [
+        {"start": 0.0, "end": 0.0, "word": "a"},
+        {"start": 0.1, "end": 0.2, "word": "b."},
+        {"start": 0.25, "end": 0.3, "word": "c."},
+    ]
+    cues = _cues(words)
+    for c, n in zip(cues, cues[1:]):
+        assert c["end"] <= n["start"]
+    assert all(c["end"] > c["start"] for c in cues)
+
+
+def test_cues_invalid_times_ignored():
+    words = [
+        {"start": None, "end": 1.0, "word": "x"},
+        {"start": float("nan"), "end": 1.0, "word": "y"},
+        {"start": 0.0, "end": 0.5, "word": " ok"},
+    ]
+    assert [c["text"] for c in _cues(words)] == ["ok"]
+
+
+def _faster_with_words():
+    mod = types.ModuleType("faster_whisper")
+    text = " ".join(["palavra"] * 12)
+
+    class WhisperModel:
+        def __init__(self, *a, **k):
+            pass
+
+        def transcribe(self, path, **kw):
+            words = [types.SimpleNamespace(start=i * 0.5, end=i * 0.5 + 0.4, word=" " + w)
+                     for i, w in enumerate(text.split())]
+
+            def gen():
+                yield types.SimpleNamespace(start=0.0, end=6.0, text=" " + text, words=words)
+
+            return gen(), types.SimpleNamespace(language="pt", language_probability=1.0)
+
+    mod.WhisperModel = WhisperModel
+    return mod
+
+
+def test_faster_short_cues(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "faster_whisper", _faster_with_words())
+    monkeypatch.setattr(config, "WHISPER_ENGINE", "faster")
+    monkeypatch.setattr(config, "SUBTITLE_MAX_CHARS", 40)
+    model = transcriber.load_model()
+    srt = transcriber.transcribe_to_srt(model, tmp_path / "a.wav", tmp_path / "a.srt").read_text(encoding="utf-8")
+    assert srt.count(" --> ") > 1
+    assert all(len(line) <= 40 for line in srt.splitlines() if "palavra" in line)
+
+
+def test_faster_old_behavior_when_disabled(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "faster_whisper", _faster_with_words())
+    monkeypatch.setattr(config, "WHISPER_ENGINE", "faster")
+    monkeypatch.setattr(config, "SUBTITLE_MAX_CHARS", 0)
+    model = transcriber.load_model()
+    srt = transcriber.transcribe_to_srt(model, tmp_path / "a.wav", tmp_path / "a.srt").read_text(encoding="utf-8")
+    assert srt.count(" --> ") == 1
+
+
+def test_openai_short_cues(monkeypatch, tmp_path):
+    mod = types.ModuleType("whisper")
+    text = " ".join(["palavra"] * 12)
+
+    class M:
+        def transcribe(self, path, **kw):
+            assert kw["word_timestamps"] is True
+            words = [{"start": i * 0.5, "end": i * 0.5 + 0.4, "word": " " + w}
+                     for i, w in enumerate(text.split())]
+            return {"segments": [{"start": 0, "end": 6, "text": text, "words": words}]}
+
+    mod.load_model = lambda name: M()
+    monkeypatch.setitem(sys.modules, "whisper", mod)
+    monkeypatch.setattr(config, "WHISPER_ENGINE", "openai")
+    monkeypatch.setattr(config, "SUBTITLE_MAX_CHARS", 40)
+    model = transcriber.load_model()
+    srt = transcriber.transcribe_to_srt(model, tmp_path / "a.wav", tmp_path / "a.srt").read_text(encoding="utf-8")
+    assert srt.count(" --> ") > 1
+
+
 @pytest.mark.skipif(
     importlib.util.find_spec("faster_whisper") is None or shutil.which(config.FFMPEG_BIN) is None,
     reason="faster-whisper ou ffmpeg indisponível",
@@ -180,3 +319,20 @@ def test_real_faster_whisper_tiny_on_sine(monkeypatch, tmp_path):
     model = transcriber.load_model("tiny")
     out = transcriber.transcribe_to_srt(model, wav, tmp_path / "seno.srt")
     assert out.exists()
+
+
+def test_orphan_in_the_middle_is_merged_into_previous():
+    from transcriber import split_into_cues
+
+    def w(s, e, t):
+        return {"start": s, "end": e, "word": t}
+
+    words = [w(0.0, 0.4, "E"), w(0.4, 0.8, "estou"), w(0.8, 1.2, "esperando"),
+             w(1.2, 1.5, "até"), w(1.5, 1.8, "hoje"), w(1.8, 2.0, "o"), w(2.0, 2.4, "50%,"),
+             w(2.4, 2.7, "né?"), w(2.8, 3.2, "O"), w(3.2, 3.6, "que"), w(3.6, 4.0, "eu"),
+             w(4.0, 4.4, "falei.")]
+    cues = split_into_cues(words, max_chars=30, max_duration=3.0)
+    texts = [c["text"] for c in cues]
+    assert "né?" not in texts
+    assert any(t.endswith("50%, né?") for t in texts)
+    assert texts[-1] == "O que eu falei."

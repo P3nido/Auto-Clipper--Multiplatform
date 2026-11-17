@@ -142,7 +142,7 @@ Reconexão: o `ChatListener` envolve qualquer fonte com backoff exponencial de 1
 Cada clipe tem **um único encode de vídeo** (otimização medida em ARCHITECTURE §10 e ADR-005):
 
 1. `extract_audio`: `ffmpeg -ss <ini> -i live_NN.ts -t <dur> -vn -ac 1 -ar 16000 -c:a pcm_s16le clip.wav`. Só áudio, mono 16 kHz (o formato que o Whisper usa). Leva cerca de 1 s. É temporário e fica em `clips/`.
-2. `transcribe_to_srt`: Whisper sobre o `.wav`, com `language=WHISPER_LANGUAGE` (`None` = detecta). Os tempos já saem relativos ao início do clipe.
+2. `transcribe_to_srt`: Whisper sobre o `.wav`, com `language=WHISPER_LANGUAGE` (`None` = detecta). Os tempos já saem relativos ao início do clipe. Com `word_timestamps`, `split_into_cues` (pura) quebra a fala em **blocos curtos, estilo redes sociais**: no máximo `SUBTITLE_MAX_CHARS` (~2 linhas no vertical) e `SUBTITLE_MAX_CUE_S`. A quebra prioriza fim de frase, vírgula e pausas, e uma palavra curta solta ("né?") é juntada ao bloco anterior.
 3. `render_clip`: `ffmpeg -ss <ini> -i live_NN.ts -t <dur> [-vf subtitles=<srt>:force_style=…] -c:v libx264 -crf … -c:a aac`. Corta e legenda numa passada só, com corte preciso no frame. **No Windows**, o caminho dentro do filtro precisaria de escape (`C\:/...`). Para evitar isso, o ffmpeg roda com `cwd=` na pasta do `.srt` e o filtro usa só o nome do arquivo. Sem `.srt`, ou com `.srt` vazio, renderiza sem o filtro.
 
 `cut_clip` continua existindo como atalho para `render_clip(..., srt_path=None)`.

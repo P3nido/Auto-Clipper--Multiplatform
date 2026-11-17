@@ -2,7 +2,7 @@
 
 Monitora um canal da **Twitch**, **YouTube** ou **Kick** só pela URL, grava a live automaticamente, encontra os momentos de maior engajamento no chat, recorta clipes de 30 s **na vertical (9:16), prontos para Reels, Shorts e TikTok**, e queima legendas geradas localmente pelo Whisper. É **100% gratuito e local**: não precisa de conta, token nem chave de API.
 
-> ✅ **Status:** v1 funcional, com as 5 etapas implementadas e validadas em lives reais (Twitch, Kick e YouTube) e 152 testes. Próximos passos de desempenho em [ARCHITECTURE.md §10](ARCHITECTURE.md#10-riscos-conhecidos).
+> ✅ **Status:** v1 funcional, com as 5 etapas implementadas e validadas em lives reais (Twitch, Kick e YouTube) e 165 testes. Próximos passos de desempenho em [ARCHITECTURE.md §10](ARCHITECTURE.md#10-riscos-conhecidos).
 
 ## Pipeline
 
@@ -52,6 +52,7 @@ Os resultados ficam em `sessions/<data>_<plataforma>_<canal>/final/`, com os nom
 ## Dicas
 
 - **Formato do clipe:** `OUTPUT_LAYOUT = "vertical_blur"` (padrão: vídeo inteiro sobre fundo desfocado, nada da tela é perdido), `"vertical_crop"` (tela cheia, corta as laterais e costuma cortar a webcam) ou `"horizontal"` (16:9 como a live).
+- **Tamanho da legenda:** os blocos têm no máximo `SUBTITLE_MAX_CHARS = 40` caracteres (~2 linhas) e `SUBTITLE_MAX_CUE_S = 3.0` segundos. `SUBTITLE_MAX_CHARS = 0` volta às frases inteiras do Whisper.
 - **Live em outro idioma:** use `WHISPER_LANGUAGE = None` em `config.py` para o Whisper detectar o idioma. Forçar `"pt"` numa live em francês gera legenda vazia ou sem sentido.
 - **Poucos ou muitos clipes:** ajuste `SPIKE_MULTIPLIER` (menor = mais sensível) e `MIN_MESSAGES_PER_BUCKET` (piso para chats pequenos).
 - **Clipe começa tarde demais:** o chat reage depois do lance. Aumente `CLIP_PRE_S` ou `CHAT_DELAY_OFFSET_S`.
