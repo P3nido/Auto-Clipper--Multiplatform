@@ -51,6 +51,8 @@ MAX_CLIPS = 30                  # limite por live (mantém os picos mais fortes)
 FFMPEG_BIN = "ffmpeg"           # ou caminho completo, ex.: r"C:\ffmpeg\bin\ffmpeg.exe"
 FFPROBE_BIN = "ffprobe"
 VIDEO_CRF = 18                  # qualidade do re-encode (menor = melhor/maior)
+VIDEO_PRESET = "veryfast"       # velocidade do x264: ultrafast ... veryslow (mais lento = menor)
+AUDIO_BITRATE = "160k"          # áudio AAC dos clipes
 
 # --- Etapa 5: transcrição e legenda -------------------------------------
 WHISPER_ENGINE = "openai"       # "openai" (padrão). "faster" fica reservado (ADR-005)

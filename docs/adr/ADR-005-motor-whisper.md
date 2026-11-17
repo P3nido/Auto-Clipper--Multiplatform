@@ -19,3 +19,10 @@ Começar com **openai-whisper**, como pedido, isolado atrás de `transcriber.loa
 ## Consequências
 - A primeira instalação é pesada (PyTorch).
 - Revisitar depois da fase 4, com tempos medidos.
+
+## Medição (fase 4, 2026-11-17)
+CPU sem GPU (PyTorch 2.15.0+cpu), modelo `small`, clipe real de 30 s em português:
+carregar o modelo 21 s (uma vez por live), transcrição **42 s** (~1,4× o tempo real).
+A qualidade em PT ficou boa (gírias e nomes próprios reconhecidos). A troca para
+faster-whisper continua sendo a principal alavanca de velocidade e deve ser
+reavaliada junto com a otimização "corte e legenda num único encode" (ARCHITECTURE.md §10).

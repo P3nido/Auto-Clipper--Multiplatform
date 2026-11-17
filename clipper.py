@@ -5,6 +5,7 @@ plan_clips() é PURA (testada). cut_clip()/probe_duration() chamam ffmpeg/ffprob
 from __future__ import annotations
 
 import logging
+import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,13 +90,57 @@ def plan_clips(
     return clips
 
 
+def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except FileNotFoundError as exc:
+        raise ClipperError(
+            f"FFmpeg não encontrado ({cmd[0]}): instale com winget install Gyan.FFmpeg "
+            "ou ajuste FFMPEG_BIN/FFPROBE_BIN em config.py"
+        ) from exc
+    except OSError as exc:
+        raise ClipperError(f"não foi possível executar {cmd[0]}: {exc}") from exc
+
+
+def _tail(text: str, lines: int = 8) -> str:
+    return "\n".join(text.strip().splitlines()[-lines:])
+
+
 def probe_duration(path: Path) -> float:
     """Duração em segundos via `ffprobe -v error -show_entries format=duration -of csv=p=0`."""
-    raise NotImplementedError
+    cmd = [
+        config.FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
+        "-of", "csv=p=0", str(path),
+    ]
+    proc = _run(cmd)
+    if proc.returncode != 0:
+        raise ClipperError(f"ffprobe falhou para {path}: {_tail(proc.stderr)}")
+    try:
+        value = float(proc.stdout.strip().splitlines()[0])
+    except (ValueError, IndexError) as exc:
+        raise ClipperError(
+            f"ffprobe retornou duração inválida para {path}: {proc.stdout!r} {_tail(proc.stderr)}"
+        ) from exc
+    if value != value or value < 0:
+        raise ClipperError(f"ffprobe retornou duração inválida para {path}: {value}")
+    return value
 
 
 def cut_clip(source: Path, spec: ClipSpec, out_path: Path) -> Path:
     """ffmpeg -y -ss <start> -i <source> -t <dur> -c:v libx264 -crf <VIDEO_CRF>
-    -preset veryfast -c:a aac -b:a 160k -movflags +faststart <out>.
+    -preset <VIDEO_PRESET> -c:a aac -b:a <AUDIO_BITRATE> -movflags +faststart <out>.
     Re-encode = corte preciso no frame (essencial para a legenda alinhar)."""
-    raise NotImplementedError
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        config.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{spec.start_s:.3f}", "-i", str(source), "-t", f"{spec.duration_s:.3f}",
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-c:v", "libx264", "-crf", str(config.VIDEO_CRF), "-preset", config.VIDEO_PRESET,
+        "-c:a", "aac", "-b:a", config.AUDIO_BITRATE, "-movflags", "+faststart", str(out_path),
+    ]
+    proc = _run(cmd)
+    if proc.returncode != 0:
+        raise ClipperError(f"ffmpeg falhou ao cortar {source}: {_tail(proc.stderr)}")
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise ClipperError(f"ffmpeg não gerou saída válida em {out_path}: {_tail(proc.stderr)}")
+    return out_path
