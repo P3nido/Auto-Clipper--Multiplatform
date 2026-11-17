@@ -54,6 +54,20 @@ Os comandos chamam `.venv\Scripts\python` direto, sem `activate`. Assim não esb
 
 Na primeira execução, o modelo do Whisper é baixado automaticamente (~460 MB para o `small`). Num trecho curto pode não sair nenhum clipe, porque o detector precisa de alguns minutos de chat para formar a média. O teste valida a gravação e o chat. Para ver clipes, deixe gravar mais tempo.
 
+
+**5. GPU NVIDIA para as legendas** (opcional, recomendado com placas RTX, ~1 GB):
+
+```powershell
+.venv\Scripts\python -m pip install -r requirements-gpu.txt
+.venv\Scripts\python main.py --diagnostico
+```
+
+O app detecta sozinho o que a máquina tem (ADR-007):
+- **Vídeo:** NVENC nas placas NVIDIA RTX/GTX, Quick Sync no vídeo integrado Intel, AMF nas AMD e CPU como último recurso.
+- **Legendas:** CUDA na GPU NVIDIA, com o modelo `large-v3-turbo` se houver 6 GB de VRAM ou mais, e CPU caso contrário.
+
+Se algo na GPU falhar, o clipe é refeito na CPU automaticamente. O `--diagnostico` explica cada escolha.
+
 > **Linux/macOS:** instale `ffmpeg` pelo gerenciador de pacotes (`apt install ffmpeg` / `brew install ffmpeg`) e use `.venv/bin/python` no lugar de `.venv\Scripts\python`.
 >
 > **Motor openai-whisper** (opcional): `pip install openai-whisper` e `WHISPER_ENGINE = "openai"` no `config.py`. Ele puxa o PyTorch (~1 GB).
@@ -76,10 +90,26 @@ Nos exemplos abaixo, `python` = `.venv\Scripts\python`.
 | `python main.py --url https://kick.com/canal` | ignora a URL do `config.py` |
 | `python main.py --process sessions/<pasta>` | refaz só os clipes de uma gravação já feita |
 | `python main.py --max-duration 3600` | para de gravar depois de N segundos e processa o que gravou |
+| `python main.py --url URL1 URL2` | acompanha várias lives ao mesmo tempo (até `MAX_PARALLEL_LIVES`) |
+| `python main.py --diagnostico` | mostra a GPU detectada, o que vai rodar onde e um mini benchmark |
 
 **Ctrl+C** durante a gravação para tudo de forma limpa e ainda gera os clipes do que foi gravado.
 
 Os resultados ficam em `sessions/<data>_<plataforma>_<canal>/final/`, com os nomes `clip_01_seg0_12m30s.mp4` (posição no vídeo gravado). O log completo fica no `run.log` da mesma pasta.
+
+## Interface gráfica
+
+Para quem não quer mexer em terminal: cole o link da live e deixe rodar.
+
+```powershell
+.venv\Scripts\python gui.py
+```
+
+- Cole o link (Twitch, Kick ou YouTube) e clique em **Adicionar live**. Dá para acompanhar várias lives ao mesmo tempo (limite em `MAX_PARALLEL_LIVES`).
+- Cada live vira um cartão com estado, tempo gravado, tamanho, mensagens do chat e picos. **Parar** encerra a gravação e o que já foi gravado vira clipes; **Abrir clipes** abre a pasta final.
+- **Ajustes** muda o formato do clipe, o idioma da legenda, a sensibilidade dos picos e a pasta de saída. Os valores ficam em `settings.json`, ao lado do app.
+- `python gui.py --demo` mostra a interface com lives simuladas, sem gravar nada.
+- Sem FFmpeg instalado, a tela avisa e mostra o comando `winget install Gyan.FFmpeg`.
 
 ## Dicas
 
@@ -95,8 +125,10 @@ Os resultados ficam em `sessions/<data>_<plataforma>_<canal>/final/`, com os nom
 ## Estrutura
 
 ```
-config.py  main.py  session.py  recorder.py  chat_listener.py
+gui.py (interface)  main.py (CLI)  engine.py (várias lives + fila de clipes)
+hardware.py (GPU)  config.py  session.py  recorder.py  chat_listener.py
 hype_detector.py  clipper.py  transcriber.py  tests/  docs/adr/
+requirements.txt  requirements-gpu.txt  requirements-dev.txt
 ```
 
 Detalhes em [ARCHITECTURE.md](ARCHITECTURE.md).

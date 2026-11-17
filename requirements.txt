@@ -17,3 +17,6 @@ av>=16,<19        # PyAV 19 removeu o parâmetro metadata_errors que o faster-wh
 
 # Opcional: motor alternativo (WHISPER_ENGINE = "openai"). Puxa o PyTorch (~1 GB).
 # openai-whisper==20250625
+
+# Interface gráfica (gui.py, ADR-008)
+PySide6>=6.8,<7
