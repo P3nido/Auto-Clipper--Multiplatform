@@ -1,20 +1,19 @@
-"""Etapa 5 — transcrição com Whisper local e legenda queimada com FFmpeg.
+"""Etapa 5 — transcrição com Whisper local (faster-whisper ou openai-whisper).
 
 load_model()/transcribe_to_srt() são as ÚNICAS funções que conhecem o motor
-de transcrição (ADR-005): trocar para faster-whisper mexe só nelas.
+de transcrição (ADR-005). A legenda é queimada por clipper.render_clip
+(um único encode).
 """
 from __future__ import annotations
 
 import logging
-import shutil
-import subprocess
-import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import config
 
-__all__ = ["TranscriberError", "load_model", "transcribe_to_srt", "format_srt", "burn_subtitles"]
+__all__ = ["TranscriberError", "load_model", "transcribe_to_srt", "format_srt"]
 
 logger = logging.getLogger(__name__)
 
@@ -23,26 +22,64 @@ class TranscriberError(RuntimeError):
     pass
 
 
-_UNSAFE_SRT_CHARS = set("'\":,[];\\%")
+@dataclass(frozen=True)
+class _Model:
+    """Modelo carregado + engine que o criou (transcribe_to_srt despacha por ele)."""
+    engine: str
+    impl: Any
 
 
 def load_model(name: str | None = None) -> Any:
-    """Carrega o modelo uma vez por pós-processamento (whisper.load_model)."""
-    if config.WHISPER_ENGINE != "openai":
-        raise TranscriberError(
-            f"engine não suportada: {config.WHISPER_ENGINE!r} (use 'openai' em config.WHISPER_ENGINE)"
-        )
-    try:
-        import whisper  # import tardio: pesado e opcional nos testes
-    except ImportError as exc:
-        raise TranscriberError(
-            "pacote 'openai-whisper' não instalado: rode pip install openai-whisper"
-        ) from exc
+    """Carrega o modelo uma vez por pós-processamento, conforme config.WHISPER_ENGINE
+    ("faster" = faster-whisper, "openai" = openai-whisper). Retorna um _Model opaco."""
+    engine = config.WHISPER_ENGINE
     model_name = name or config.WHISPER_MODEL
+    if engine == "faster":
+        try:
+            from faster_whisper import WhisperModel  # import tardio: pesado
+        except ImportError as exc:
+            raise TranscriberError(
+                "pacote 'faster-whisper' não instalado: rode pip install faster-whisper"
+            ) from exc
+        try:
+            impl = WhisperModel(model_name, device="cpu", compute_type=config.WHISPER_COMPUTE_TYPE)
+        except Exception as exc:
+            raise TranscriberError(f"falha ao carregar o modelo Whisper {model_name!r}: {exc}") from exc
+        return _Model(engine, impl)
+    if engine == "openai":
+        try:
+            import whisper  # import tardio: pesado e opcional nos testes
+        except ImportError as exc:
+            raise TranscriberError(
+                "pacote 'openai-whisper' não instalado: rode pip install openai-whisper"
+            ) from exc
+        try:
+            return _Model(engine, whisper.load_model(model_name))
+        except Exception as exc:
+            raise TranscriberError(f"falha ao carregar o modelo Whisper {model_name!r}: {exc}") from exc
+    raise TranscriberError(
+        f"engine não suportada: {engine!r} (use 'faster' ou 'openai' em config.WHISPER_ENGINE)"
+    )
+
+
+def _read_wav_16k_mono(path: Path) -> Any | None:
+    """Lê um WAV PCM16 mono 16 kHz (o formato de clipper.extract_audio) como float32.
+    Evita a decodificação via PyAV do faster-whisper, que quebra com versões do `av`
+    incompatíveis (ex.: av 19 + faster-whisper 1.2.1). Retorna None se não se aplicar."""
+    if Path(path).suffix.lower() != ".wav" or not Path(path).is_file():
+        return None
     try:
-        return whisper.load_model(model_name)
-    except Exception as exc:
-        raise TranscriberError(f"falha ao carregar o modelo Whisper {model_name!r}: {exc}") from exc
+        import wave
+
+        import numpy as np
+
+        with wave.open(str(path), "rb") as wf:
+            if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000:
+                return None
+            raw = wf.readframes(wf.getnframes())
+        return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    except Exception:  # noqa: BLE001 - cai no caminho normal (arquivo)
+        return None
 
 
 def _fmt_ts(seconds: float) -> str:
@@ -66,69 +103,31 @@ def format_srt(segments: list[dict[str, Any]]) -> str:
     return "\n".join(blocks)
 
 
-def transcribe_to_srt(model: Any, clip_path: Path, out_srt: Path, language: str | None = None) -> Path:
-    """model.transcribe(str(clip), language=..., fp16=False) -> format_srt -> grava UTF-8.
-    Clipe sem fala gera SRT vazio (não é erro)."""
+def transcribe_to_srt(model: Any, media_path: Path, out_srt: Path, language: str | None = None) -> Path:
+    """Transcreve áudio/vídeo e grava o SRT em UTF-8. Sem fala = SRT vazio (não é erro).
+    language None -> config.WHISPER_LANGUAGE (None = detecção automática)."""
+    lang = language if language is not None else config.WHISPER_LANGUAGE
+    if not isinstance(model, _Model):  # aceita um modelo openai cru (compatibilidade)
+        model = _Model("openai", model)
     try:
-        result = model.transcribe(
-            str(clip_path), language=language or config.WHISPER_LANGUAGE, fp16=False, verbose=None
-        )
-        srt = format_srt(result.get("segments", []))
+        if model.engine == "faster":
+            audio = _read_wav_16k_mono(media_path)
+            segments, info = model.impl.transcribe(
+                audio if audio is not None else str(media_path), language=lang, vad_filter=config.WHISPER_VAD, beam_size=5
+            )
+            # o gerador é lazy: precisa ser consumido dentro do try
+            items = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
+            logger.debug(
+                "idioma detectado: %s (p=%.2f)",
+                getattr(info, "language", None),
+                float(getattr(info, "language_probability", 0.0) or 0.0),
+            )
+        else:
+            result = model.impl.transcribe(str(media_path), language=lang, fp16=False, verbose=None)
+            items = result.get("segments", [])
+        srt = format_srt(items)
     except Exception as exc:
-        raise TranscriberError(f"falha ao transcrever {clip_path}: {exc}") from exc
+        raise TranscriberError(f"falha ao transcrever {media_path}: {exc}") from exc
     out_srt.parent.mkdir(parents=True, exist_ok=True)
     out_srt.write_text(srt, encoding="utf-8")
     return out_srt
-
-
-def burn_subtitles(clip_path: Path, srt_path: Path, out_path: Path) -> Path:
-    """ffmpeg -y -i <clip> -vf "subtitles=<srt>:force_style='<SUBTITLE_STYLE>'"
-    -c:v libx264 -crf <VIDEO_CRF> -preset <VIDEO_PRESET> -c:a copy <out>.
-
-    Windows: o filtro subtitles exige escapar ':' e '\\' no caminho. Para evitar
-    isso, rode o ffmpeg com cwd=srt_path.parent e passe só o NOME do .srt.
-    SRT vazio: copia o clipe sem legenda."""
-    clip_abs = Path(clip_path).resolve()
-    srt_abs = Path(srt_path).resolve()
-    out_abs = Path(out_path).resolve()
-    out_abs.parent.mkdir(parents=True, exist_ok=True)
-
-    if not srt_abs.read_text(encoding="utf-8", errors="replace").strip():
-        logger.info("SRT vazio; copiando %s sem legenda", clip_abs.name)
-        shutil.copyfile(clip_abs, out_abs)
-        return out_abs
-
-    tmp_srt: Path | None = None
-    srt_name = srt_abs.name
-    if any(c in _UNSAFE_SRT_CHARS for c in srt_name) or not srt_name.isascii():
-        tmp_srt = srt_abs.parent / f"_burn_{uuid.uuid4().hex[:8]}.srt"
-        shutil.copyfile(srt_abs, tmp_srt)
-        srt_name = tmp_srt.name
-
-    cmd = [
-        config.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-i", str(clip_abs),
-        "-vf", f"subtitles={srt_name}:force_style='{config.SUBTITLE_STYLE}'",
-        "-c:v", "libx264", "-crf", str(config.VIDEO_CRF), "-preset", config.VIDEO_PRESET,
-        "-c:a", "copy", "-movflags", "+faststart", str(out_abs),
-    ]
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            cwd=str(srt_abs.parent),
-        )
-    except FileNotFoundError as exc:
-        raise TranscriberError(
-            "FFmpeg não encontrado: instale com winget install Gyan.FFmpeg "
-            "ou ajuste FFMPEG_BIN em config.py"
-        ) from exc
-    except OSError as exc:
-        raise TranscriberError(f"não foi possível executar {config.FFMPEG_BIN}: {exc}") from exc
-    finally:
-        if tmp_srt is not None:
-            tmp_srt.unlink(missing_ok=True)
-    if proc.returncode != 0:
-        tail = "\n".join(proc.stderr.strip().splitlines()[-8:])
-        raise TranscriberError(f"ffmpeg falhou ao queimar legenda em {clip_abs}: {tail}")
-    if not out_abs.exists() or out_abs.stat().st_size == 0:
-        raise TranscriberError(f"ffmpeg não gerou saída válida em {out_abs}")
-    return out_abs

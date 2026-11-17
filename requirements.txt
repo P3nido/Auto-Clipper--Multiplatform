@@ -11,5 +11,9 @@ streamlink==8.6.3
 # necessário por causa do Cloudflare da Kick (ADR-002)
 curl_cffi>=0.17,<1
 
-# Etapa 5: transcrição (puxa PyTorch, a primeira instalação é pesada)
-openai-whisper==20250625
+# Etapa 5: transcrição. Motor padrão, sem PyTorch (ADR-005)
+faster-whisper>=1.2,<2
+av>=16,<19        # PyAV 19 removeu o parâmetro metadata_errors que o faster-whisper 1.2.1 usa
+
+# Opcional: motor alternativo (WHISPER_ENGINE = "openai"). Puxa o PyTorch (~1 GB).
+# openai-whisper==20250625

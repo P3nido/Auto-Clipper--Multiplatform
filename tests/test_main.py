@@ -9,7 +9,7 @@ import pytest
 
 import config
 import main
-from clipper import ClipSpec
+from clipper import ClipperError, ClipSpec
 from hype_detector import Spike
 from session import Session
 
@@ -34,26 +34,37 @@ def _session_with_segment(tmp_path) -> Session:
     return session
 
 
-def _patch_pipeline(monkeypatch, specs, fail_burn_on=()):
+def _patch_pipeline(monkeypatch, specs, fail_render_on=(), no_audio=False):
     monkeypatch.setattr(main, "find_spikes", lambda s: [Spike(0, 50.0, 20, 4.0)])
     monkeypatch.setattr(main, "probe_duration", lambda p: 600.0)
     monkeypatch.setattr(main, "plan_clips", lambda *a, **k: specs)
-    monkeypatch.setattr(main, "cut_clip", lambda src, spec, out: (out.write_bytes(b"c"), out)[1])
-    monkeypatch.setattr(main, "transcribe_to_srt", lambda m, clip, srt: (srt.write_text("s"), srt)[1])
+    seen: dict = {"wavs": [], "srts": {}}
 
-    def burn(clip, srt, out):
-        if out.name in fail_burn_on or any(k in out.name for k in fail_burn_on):
-            raise RuntimeError("burn falhou")
+    def extract(src, spec, wav):
+        if no_audio:
+            raise ClipperError("sem trilha de áudio")
+        wav.write_bytes(b"w")
+        seen["wavs"].append(wav)
+        return wav
+
+    monkeypatch.setattr(main, "extract_audio", extract)
+    monkeypatch.setattr(main, "transcribe_to_srt", lambda m, wav, srt: (srt.write_text("s"), srt)[1])
+
+    def render(src, spec, out, srt=None):
+        if any(k in out.name for k in fail_render_on):
+            raise RuntimeError("render falhou")
+        seen["srts"][out.name] = srt
         out.write_bytes(b"f")
         return out
 
-    monkeypatch.setattr(main, "burn_subtitles", burn)
+    monkeypatch.setattr(main, "render_clip", render)
+    return seen
 
 
 def test_postprocess_second_clip_fails(tmp_path, monkeypatch):
     session = _session_with_segment(tmp_path)
     specs = [ClipSpec(0, 10.0, 30.0, 20), ClipSpec(0, 100.0, 30.0, 15)]
-    _patch_pipeline(monkeypatch, specs, fail_burn_on=("clip_02",))
+    _patch_pipeline(monkeypatch, specs, fail_render_on=("clip_02",))
     monkeypatch.setattr(main, "load_model", lambda: object())
     finals = main.postprocess(session)
     assert len(finals) == 1
@@ -93,6 +104,33 @@ def test_postprocess_deletes_raw_when_all_ok(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DELETE_RAW_AFTER_PROCESS", True)
     assert len(main.postprocess(session)) == 1
     assert not session.segments[0].path.exists()
+
+
+def test_postprocess_wav_deleted_and_srt_used(tmp_path, monkeypatch):
+    session = _session_with_segment(tmp_path)
+    seen = _patch_pipeline(monkeypatch, [ClipSpec(0, 10.0, 30.0, 20)])
+    monkeypatch.setattr(main, "load_model", lambda: object())
+    assert len(main.postprocess(session)) == 1
+    assert len(seen["wavs"]) == 1 and not seen["wavs"][0].exists()
+    assert seen["srts"]["clip_01_seg0_00m10s.mp4"] is not None
+
+
+def test_postprocess_wav_deleted_even_if_render_fails(tmp_path, monkeypatch):
+    session = _session_with_segment(tmp_path)
+    seen = _patch_pipeline(monkeypatch, [ClipSpec(0, 10.0, 30.0, 20)], fail_render_on=("clip_01",))
+    monkeypatch.setattr(main, "load_model", lambda: object())
+    assert main.postprocess(session) == []
+    assert not seen["wavs"][0].exists()
+
+
+def test_postprocess_segment_without_audio_renders_without_subs(tmp_path, monkeypatch):
+    session = _session_with_segment(tmp_path)
+    seen = _patch_pipeline(monkeypatch, [ClipSpec(0, 10.0, 30.0, 20)], no_audio=True)
+    monkeypatch.setattr(main, "load_model", lambda: object())
+    finals = main.postprocess(session)
+    assert len(finals) == 1 and finals[0].exists()
+    assert seen["srts"]["clip_01_seg0_00m10s.mp4"] is None
+    assert session.status["postprocess"] == "ok: 1/1 clipes"
 
 
 class _FakeSource:
@@ -172,6 +210,25 @@ def test_check_prerequisites_missing_ffmpeg(monkeypatch):
     monkeypatch.setattr(config, "FFMPEG_BIN", "ffmpeg-inexistente-xyz")
     monkeypatch.setattr(main.sys, "platform", "linux")
     with pytest.raises(main.PrerequisiteError, match="winget"):
+        main.check_prerequisites(URL)
+
+
+def test_check_prerequisites_faster_missing(monkeypatch):
+    monkeypatch.setattr(main, "_resolve_ffmpeg_tools", lambda: None)
+    real = main.importlib.util.find_spec
+    monkeypatch.setattr(config, "WHISPER_ENGINE", "faster")
+    monkeypatch.setattr(
+        main.importlib.util, "find_spec",
+        lambda n, *a: None if n == "faster_whisper" else real(n, *a),
+    )
+    with pytest.raises(main.PrerequisiteError, match="faster-whisper"):
+        main.check_prerequisites(URL)
+
+
+def test_check_prerequisites_unknown_engine(monkeypatch):
+    monkeypatch.setattr(main, "_resolve_ffmpeg_tools", lambda: None)
+    monkeypatch.setattr(config, "WHISPER_ENGINE", "xyz")
+    with pytest.raises(main.PrerequisiteError, match="desconhecido"):
         main.check_prerequisites(URL)
 
 

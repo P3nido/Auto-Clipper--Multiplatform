@@ -23,11 +23,11 @@ from pathlib import Path
 
 import config
 from chat_listener import ChatListener, detect_platform, make_chat_source
-from clipper import cut_clip, plan_clips, probe_duration
+from clipper import ClipperError, extract_audio, plan_clips, probe_duration, render_clip
 from hype_detector import find_spikes
 from recorder import Recorder, RecorderError, is_live
 from session import Session
-from transcriber import burn_subtitles, load_model, transcribe_to_srt
+from transcriber import load_model, transcribe_to_srt
 
 __all__ = [
     "PrerequisiteError", "main", "monitor_loop", "run_session", "postprocess",
@@ -132,8 +132,17 @@ def check_prerequisites(url: str | None = None) -> None:
         detect_platform(target)
     except ValueError as exc:
         raise PrerequisiteError(f"URL não suportada ({target}): {exc}") from exc
-    if importlib.util.find_spec("whisper") is None:
-        raise PrerequisiteError("openai-whisper não instalado. Rode: pip install openai-whisper")
+    engine = config.WHISPER_ENGINE
+    if engine == "faster":
+        if importlib.util.find_spec("faster_whisper") is None:
+            raise PrerequisiteError("faster-whisper não instalado. Rode: pip install faster-whisper")
+    elif engine == "openai":
+        if importlib.util.find_spec("whisper") is None:
+            raise PrerequisiteError("openai-whisper não instalado. Rode: pip install openai-whisper")
+    else:
+        raise PrerequisiteError(
+            f"WHISPER_ENGINE desconhecido: {engine!r} (use 'faster' ou 'openai')"
+        )
 
 
 def run_session(url: str, *, max_duration: float | None = None) -> Session:
@@ -242,13 +251,22 @@ def postprocess(session: Session) -> list[Path]:
     for i, spec in enumerate(specs, start=1):
         began = time.monotonic()
         name = _clip_name(i, spec.segment_index, spec.start_s)
+        src = sources[spec.segment_index]
+        wav = session.clips_dir / f"{name}.wav"
         try:
-            clip = cut_clip(sources[spec.segment_index], spec, session.clips_dir / f"{name}.mp4")
-            srt = transcribe_to_srt(model, clip, session.subs_dir / f"{name}.srt")
-            final = burn_subtitles(clip, srt, session.final_dir / f"{name}.mp4")
+            srt: Path | None = None
+            try:
+                extract_audio(src, spec, wav)
+            except ClipperError as exc:
+                logger.warning("clipe %s sem áudio utilizável (%s); renderizando sem legenda", name, exc)
+            else:
+                srt = transcribe_to_srt(model, wav, session.subs_dir / f"{name}.srt")
+            final = render_clip(src, spec, session.final_dir / f"{name}.mp4", srt)
         except Exception:  # noqa: BLE001 - um clipe ruim não derruba os outros
             logger.exception("clipe %d/%d falhou (%s)", i, total, name)
             continue
+        finally:
+            wav.unlink(missing_ok=True)
         finals.append(final)
         logger.info("clipe %d/%d pronto (%.1f s)", i, total, time.monotonic() - began)
 

@@ -31,9 +31,10 @@ Um processo Python local, sem contas nem chaves de API, que:
                     ▼                                                        │
             ─── PÓS-PROCESSAMENTO (também roda isolado: --process <dir>) ─── │
             hype_detector.find_spikes(session)      → spikes.json            │
-            clipper.plan_clips() + cut_clip()       → clips/clip_NN.mp4      │
+            clipper.plan_clips()                    → janelas dos clipes      │
+            clipper.extract_audio()                 → clips/clip_NN.wav (tmp) │
             transcriber.transcribe_to_srt()         → subs/clip_NN.srt       │
-            transcriber.burn_subtitles()            → final/clip_NN.mp4      │
+            clipper.render_clip()  (1 encode)       → final/clip_NN.mp4      │
                     └────────────────────────────── volta a monitorar ───────┘
 ```
 
@@ -84,8 +85,8 @@ Dependências fluem num sentido só: `main → (recorder, chat_listener, hype_de
 | `recorder.py` | `is_live(url)`, `Recorder`, `remux_to_mp4()`, `RecorderError` | subprocess, disco |
 | `chat_listener.py` | `ChatMessage`, `ChatSource` (+ `TwitchIRCSource`, `KickHistorySource`, `YouTubeInnerTubeSource`), `detect_platform()`, `channel_from_url()`, `make_chat_source()`, `ChatListener` | rede, disco |
 | `hype_detector.py` | `Spike`, `bucketize()`, `detect_spike_buckets()`, `find_spikes()` | só `find_spikes` lê disco |
-| `clipper.py` | `ClipSpec`, `plan_clips()`, `cut_clip()`, `probe_duration()`, `ClipperError` | subprocess |
-| `transcriber.py` | `load_model()`, `transcribe_to_srt()`, `burn_subtitles()`, `TranscriberError` | modelo, subprocess |
+| `clipper.py` | `ClipSpec`, `plan_clips()`, `probe_duration()`, `extract_audio()`, `render_clip()`, `cut_clip()`, `ClipperError` | subprocess |
+| `transcriber.py` | `load_model()`, `transcribe_to_srt()`, `format_srt()`, `TranscriberError` | modelo |
 | `main.py` | `main()`, `monitor_loop()`, `run_session()`, `postprocess()` | orquestra |
 
 Os esqueletos `.py` já contêm as assinaturas, dataclasses e docstrings, e eles são o contrato que o subagente `coder` implementa.
@@ -94,7 +95,7 @@ Os esqueletos `.py` já contêm as assinaturas, dataclasses e docstrings, e eles
 
 O pico é detectado pelo **relógio do chat**, mas o corte é feito pelo **tempo do vídeo**. Se esses dois relógios divergirem, o clipe sai deslocado. Ver [ADR-004](docs/adr/ADR-004-modelo-de-tempo.md).
 
-- Toda mensagem recebe `wall_ts = time.time()` **no momento da recepção**.
+- Toda mensagem tem `wall_ts` = instante de **envio** informado pela plataforma (ver §7). Na falta dele, usa-se a recepção.
 - Cada `RecordingSegment` guarda `wall_start` = instante em que **o primeiro byte** foi escrito no `.ts`, e não o instante em que o streamlink foi iniciado (a diferença pode passar de 5 s).
 - **Anúncios da Twitch:** o Streamlink filtra os anúncios, então o arquivo "pula" esse trecho e fica mais curto que o tempo de parede. O `Recorder` lê o stderr do streamlink (`Detected advertisement break of N seconds`) e registra `ad_breaks` no segmento. A conversão `wall_ts → offset no vídeo` subtrai os anúncios anteriores, e um pico **dentro** de um anúncio é descartado.
 - **Quedas:** se o streamlink sair e a live continuar, abre-se um novo segmento (`live_01.ts`). Um pico pertence ao segmento cujo intervalo de parede o contém.
@@ -138,9 +139,13 @@ Reconexão: o `ChatListener` envolve qualquer fonte com backoff exponencial de 1
 ## 8. Recorte e legendas
 
 - `plan_clips` (pura): converte picos em janelas `[pico − PRE, pico + POST]`, ajusta os limites ao `[0, duração]` do segmento, **funde** janelas sobrepostas e limita a `MAX_CLIPS` (mantém os picos de maior contagem).
-- `cut_clip`: `ffmpeg -ss <ini> -i live_NN.ts -t <dur> -c:v libx264 -crf 18 -preset veryfast -c:a aac`. Esse re-encode garante um corte preciso no frame, e sem ele a legenda sairia desalinhada.
-- `transcribe_to_srt`: Whisper com `language=WHISPER_LANGUAGE`, gerando os segmentos em SRT.
-- `burn_subtitles`: `-vf subtitles=<srt>:force_style=<SUBTITLE_STYLE>`. **No Windows**, o caminho dentro do filtro precisa de escape (`C\:/...`). Para evitar isso, o ffmpeg roda com `cwd=` na pasta da sessão e o filtro usa caminho relativo.
+Cada clipe tem **um único encode de vídeo** (otimização medida em ARCHITECTURE §10 e ADR-005):
+
+1. `extract_audio`: `ffmpeg -ss <ini> -i live_NN.ts -t <dur> -vn -ac 1 -ar 16000 -c:a pcm_s16le clip.wav`. Só áudio, mono 16 kHz (o formato que o Whisper usa). Leva cerca de 1 s. É temporário e fica em `clips/`.
+2. `transcribe_to_srt`: Whisper sobre o `.wav`, com `language=WHISPER_LANGUAGE` (`None` = detecta). Os tempos já saem relativos ao início do clipe.
+3. `render_clip`: `ffmpeg -ss <ini> -i live_NN.ts -t <dur> [-vf subtitles=<srt>:force_style=…] -c:v libx264 -crf … -c:a aac`. Corta e legenda numa passada só, com corte preciso no frame. **No Windows**, o caminho dentro do filtro precisaria de escape (`C\:/...`). Para evitar isso, o ffmpeg roda com `cwd=` na pasta do `.srt` e o filtro usa só o nome do arquivo. Sem `.srt`, ou com `.srt` vazio, renderiza sem o filtro.
+
+`cut_clip` continua existindo como atalho para `render_clip(..., srt_path=None)`.
 
 ## 9. Tratamento de erros
 
@@ -158,10 +163,7 @@ Reconexão: o `ChatListener` envolve qualquer fonte com backoff exponencial de 1
 1. **Endpoints internos (Kick e YouTube)** não são documentados e podem mudar sem aviso. Isso já aconteceu duas vezes: o `chat-downloader` quebrou e a Kick desativou o Pusher (ver ADR-002). *Mitigação:* adaptadores pequenos e isolados, erro claro no log e a gravação independente do chat.
 2. **Kick + Cloudflare:** tanto a gravação (Streamlink precisa de Chrome/Chromium) quanto o chat (`curl_cffi` imitando o Chrome) dependem de passar pelo desafio.
 3. **Disco:** medido na fase 2 (Twitch 1080p60 em `best`): cerca de 0,83 MB/s, ou seja, **~3 GB por hora** e ~12 GB numa live de 4 h. Para reduzir, use `STREAM_QUALITY = "720p"` ou `DELETE_RAW_AFTER_PROCESS`.
-4. **CPU (medido na fase 4, 1080p60, só CPU):** cada clipe de 30 s leva **~107 s** (corte 37 s + Whisper `small` 42 s + queima 27 s), mais 21 s para carregar o modelo uma vez por live. Com `MAX_CLIPS = 30`, são ~55 min de pós-processamento. Otimizações já identificadas, em ordem de ganho:
-   - **a)** corte e legenda num **único encode**, passando ao Whisper só o áudio da janela: economiza ~35 s por clipe e uma geração de perda;
-   - **b)** **faster-whisper** (ADR-005): ~4× mais rápido na transcrição;
-   - **c)** saída em 720p ou vertical 9:16 (formato de redes sociais): encode bem mais leve.
+4. **CPU:** com faster-whisper e encode único (ADR-005), cada clipe de 30 s em 1080p60 leva **~40 s** (eram ~132 s). Com `MAX_CLIPS = 30`, são ~20 min de pós-processamento. O gargalo agora é o encode x264 em 1080p60, e a próxima alavanca é a saída em 720p ou vertical 9:16 (formato de redes sociais).
 
 ## 11. Roteiro de implementação
 

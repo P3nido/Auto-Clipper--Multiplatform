@@ -26,7 +26,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-A primeira instalação baixa o PyTorch, que é pesado. O modelo do Whisper é baixado no primeiro uso.
+O modelo do Whisper (faster-whisper) é baixado no primeiro uso, ~460 MB para o `small`. O motor openai-whisper é opcional e puxa o PyTorch (veja requirements.txt).
 
 ## Uso
 
@@ -54,7 +54,7 @@ Os resultados ficam em `sessions/<data>_<plataforma>_<canal>/final/`, com os nom
 - **Live em outro idioma:** use `WHISPER_LANGUAGE = None` em `config.py` para o Whisper detectar o idioma. Forçar `"pt"` numa live em francês gera legenda vazia ou sem sentido.
 - **Poucos ou muitos clipes:** ajuste `SPIKE_MULTIPLIER` (menor = mais sensível) e `MIN_MESSAGES_PER_BUCKET` (piso para chats pequenos).
 - **Clipe começa tarde demais:** o chat reage depois do lance. Aumente `CLIP_PRE_S` ou `CHAT_DELAY_OFFSET_S`.
-- **Tempo de processamento:** em CPU, cada clipe de 30 s em 1080p leva ~1 min 45 s com o modelo `small`. O modelo `base` é ~2× mais rápido, com legenda um pouco pior.
+- **Tempo de processamento:** em CPU, cada clipe de 30 s em 1080p leva ~40 s (faster-whisper `small` + 1 encode). O gargalo é o encode do vídeo em 1080p, e `STREAM_QUALITY = "720p"` acelera bastante.
 - **Disco:** ~3 GB por hora em `best`. Use `STREAM_QUALITY = "720p"` ou `DELETE_RAW_AFTER_PROCESS = True`.
 - **FFmpeg recém-instalado:** se o terminal ainda não enxerga o `ffmpeg`, o programa encontra sozinho o atalho do winget.
 

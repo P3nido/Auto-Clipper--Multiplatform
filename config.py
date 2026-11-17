@@ -55,7 +55,9 @@ VIDEO_PRESET = "veryfast"       # velocidade do x264: ultrafast ... veryslow (ma
 AUDIO_BITRATE = "160k"          # áudio AAC dos clipes
 
 # --- Etapa 5: transcrição e legenda -------------------------------------
-WHISPER_ENGINE = "openai"       # "openai" (padrão). "faster" fica reservado (ADR-005)
+WHISPER_ENGINE = "faster"       # "faster" (faster-whisper, ~4x mais rápido em CPU) ou "openai" (ADR-005)
+WHISPER_COMPUTE_TYPE = "int8"   # faster-whisper em CPU: "int8" (rápido) ou "float32" (mais preciso, mais lento)
+WHISPER_VAD = True              # faster-whisper: pula trechos sem fala (música, silêncio)
 WHISPER_LANGUAGE: str | None = "pt"  # None = detecta o idioma automaticamente (lives em outras línguas)
 SUBTITLE_STYLE = (
     "FontName=Arial,FontSize=16,Bold=1,PrimaryColour=&H00FFFFFF,"

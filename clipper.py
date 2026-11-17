@@ -5,7 +5,9 @@ plan_clips() é PURA (testada). cut_clip()/probe_duration() chamam ffmpeg/ffprob
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,12 +15,18 @@ from pathlib import Path
 import config
 from hype_detector import Spike
 
-__all__ = ["ClipperError", "ClipSpec", "plan_clips", "probe_duration", "cut_clip"]
+__all__ = [
+    "ClipperError", "ClipSpec", "plan_clips", "probe_duration",
+    "extract_audio", "render_clip", "cut_clip",
+]
 
 logger = logging.getLogger(__name__)
 
 # Janelas mais curtas que isso (após o recorte nos limites do vídeo) são descartadas.
 MIN_CLIP_S = 3.0
+
+# Caracteres que quebram o parsing do filtro subtitles= do ffmpeg.
+_UNSAFE_SRT_CHARS = set("'\":,[];\\%")
 
 
 class ClipperError(RuntimeError):
@@ -90,9 +98,11 @@ def plan_clips(
     return clips
 
 
-def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+def _run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        return subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=cwd
+        )
     except FileNotFoundError as exc:
         raise ClipperError(
             f"FFmpeg não encontrado ({cmd[0]}): instale com winget install Gyan.FFmpeg "
@@ -126,21 +136,78 @@ def probe_duration(path: Path) -> float:
     return value
 
 
-def cut_clip(source: Path, spec: ClipSpec, out_path: Path) -> Path:
-    """ffmpeg -y -ss <start> -i <source> -t <dur> -c:v libx264 -crf <VIDEO_CRF>
-    -preset <VIDEO_PRESET> -c:a aac -b:a <AUDIO_BITRATE> -movflags +faststart <out>.
-    Re-encode = corte preciso no frame (essencial para a legenda alinhar)."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def extract_audio(source: Path, spec: ClipSpec, out_wav: Path) -> Path:
+    """Extrai a janela do clipe como WAV mono 16 kHz (entrada ideal do Whisper).
+    Fonte sem trilha de áudio -> ClipperError."""
+    out_abs = Path(out_wav).resolve()
+    out_abs.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         config.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
-        "-ss", f"{spec.start_s:.3f}", "-i", str(source), "-t", f"{spec.duration_s:.3f}",
-        "-map", "0:v:0", "-map", "0:a:0?",
-        "-c:v", "libx264", "-crf", str(config.VIDEO_CRF), "-preset", config.VIDEO_PRESET,
-        "-c:a", "aac", "-b:a", config.AUDIO_BITRATE, "-movflags", "+faststart", str(out_path),
+        "-ss", f"{spec.start_s:.3f}", "-i", str(Path(source).resolve()), "-t", f"{spec.duration_s:.3f}",
+        "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(out_abs),
     ]
     proc = _run(cmd)
     if proc.returncode != 0:
-        raise ClipperError(f"ffmpeg falhou ao cortar {source}: {_tail(proc.stderr)}")
-    if not out_path.exists() or out_path.stat().st_size == 0:
-        raise ClipperError(f"ffmpeg não gerou saída válida em {out_path}: {_tail(proc.stderr)}")
-    return out_path
+        err = _tail(proc.stderr)
+        if "matches no streams" in err or "does not contain any stream" in err:
+            raise ClipperError(f"sem trilha de áudio em {source}: {err}")
+        raise ClipperError(f"ffmpeg falhou ao extrair áudio de {source}: {err}")
+    if not out_abs.exists() or out_abs.stat().st_size == 0:
+        raise ClipperError(f"ffmpeg não gerou áudio válido em {out_abs}: {_tail(proc.stderr)}")
+    return out_abs
+
+
+def render_clip(source: Path, spec: ClipSpec, out_path: Path, srt_path: Path | None = None) -> Path:
+    """Corta e (opcionalmente) queima a legenda em UM único encode.
+
+    Windows: o filtro subtitles exige escapar ':' e '\' no caminho; por isso o ffmpeg
+    roda com cwd=srt.parent e recebe só o NOME do .srt (copiado para um nome seguro
+    se tiver caracteres problemáticos). srt None ou só whitespace -> sem legenda."""
+    src_abs = Path(source).resolve()
+    out_abs = Path(out_path).resolve()
+    out_abs.parent.mkdir(parents=True, exist_ok=True)
+
+    srt_abs: Path | None = None
+    if srt_path is not None:
+        candidate = Path(srt_path).resolve()
+        if candidate.exists() and candidate.read_text(encoding="utf-8", errors="replace").strip():
+            srt_abs = candidate
+        else:
+            logger.info("SRT vazio ou ausente; renderizando %s sem legenda", out_abs.name)
+
+    tmp_srt: Path | None = None
+    cmd = [
+        config.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{spec.start_s:.3f}", "-i", str(src_abs), "-t", f"{spec.duration_s:.3f}",
+        "-map", "0:v:0", "-map", "0:a:0?",
+    ]
+    cwd: str | None = None
+    if srt_abs is not None:
+        srt_name = srt_abs.name
+        if any(c in _UNSAFE_SRT_CHARS for c in srt_name) or not srt_name.isascii():
+            tmp_srt = srt_abs.parent / f"_burn_{uuid.uuid4().hex[:8]}.srt"
+            shutil.copyfile(srt_abs, tmp_srt)
+            srt_name = tmp_srt.name
+        cmd += ["-vf", f"subtitles={srt_name}:force_style='{config.SUBTITLE_STYLE}'"]
+        cwd = str(srt_abs.parent)
+    cmd += [
+        "-c:v", "libx264", "-crf", str(config.VIDEO_CRF), "-preset", config.VIDEO_PRESET,
+        "-c:a", "aac", "-b:a", config.AUDIO_BITRATE, "-movflags", "+faststart", str(out_abs),
+    ]
+    try:
+        proc = _run(cmd, cwd=cwd)
+    finally:
+        if tmp_srt is not None:
+            tmp_srt.unlink(missing_ok=True)
+    if proc.returncode != 0:
+        raise ClipperError(f"ffmpeg falhou ao renderizar {src_abs}: {_tail(proc.stderr)}")
+    if not out_abs.exists() or out_abs.stat().st_size == 0:
+        raise ClipperError(f"ffmpeg não gerou saída válida em {out_abs}: {_tail(proc.stderr)}")
+    return out_abs
+
+
+def cut_clip(source: Path, spec: ClipSpec, out_path: Path) -> Path:
+    """Corte preciso sem legenda (compatibilidade): render_clip sem SRT."""
+    return render_clip(source, spec, out_path, None)

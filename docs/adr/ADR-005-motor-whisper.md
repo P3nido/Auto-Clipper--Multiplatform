@@ -1,28 +1,43 @@
-# ADR-005: Motor de transcrição
+# ADR-005: Motor de transcrição e encode único por clipe
 
-**Status:** Proposto · **Data:** 2026-11-17
+**Status:** Aceito (revisado em 2026-11-17 após as medições da fase 4) · **Data original:** 2026-11-17
 
 ## Contexto
-O pedido especifica OpenAI Whisper local (`base`/`small`, `pt`). O alvo é CPU em Windows.
+O pedido especifica Whisper local (`base`/`small`, `pt`), e o alvo é CPU em Windows. A fase 4 mediu, com CPU sem GPU (PyTorch 2.15.0+cpu), um clipe real de 30 s em 1080p60:
+
+| Etapa | Tempo |
+|---|---|
+| corte com re-encode | 37 s |
+| openai-whisper `small` | 42 s (+21 s para carregar o modelo, uma vez por live) |
+| queima da legenda, segundo re-encode | 27 s |
+| **total** | **~107 s por clipe**, ~55 min para 30 clipes |
 
 ## Opções
 | | openai-whisper | faster-whisper |
 |---|---|---|
 | Velocidade em CPU | 1× | ~4× (CTranslate2, int8) |
-| Instalação | puxa PyTorch (~1 GB+) | sem PyTorch |
-| Qualidade | referência | equivalente (mesmos pesos) |
-| Precisa de ffmpeg | sim | não (usa PyAV) |
+| Instalação | PyTorch (~1 GB+) | sem PyTorch (ctranslate2 + PyAV) |
+| Qualidade | referência | equivalente (mesmos pesos convertidos) |
+| Extras | — | filtro VAD embutido (pula música e silêncio) |
 
 ## Decisão
-Começar com **openai-whisper**, como pedido, isolado atrás de `transcriber.load_model()`/`transcribe_to_srt()`, que são as únicas funções que conhecem o motor. Trocar para faster-whisper vira uma alteração em um arquivo, acionada por `WHISPER_ENGINE` em `config.py` se a velocidade incomodar.
+1. **faster-whisper é o motor padrão** (`WHISPER_ENGINE = "faster"`, `compute_type="int8"`, `vad_filter=True`). O openai-whisper continua disponível com `WHISPER_ENGINE = "openai"`, e a dependência dele (com PyTorch) passa a ser **opcional**.
+2. **Um encode de vídeo por clipe:** extrai só o áudio da janela (rápido) → transcreve → `render_clip` corta e queima a legenda numa passada (ARCHITECTURE §8). Isso elimina o segundo re-encode e uma geração de perda de qualidade.
 
 ## Consequências
-- A primeira instalação é pesada (PyTorch).
-- Revisitar depois da fase 4, com tempos medidos.
+- Instalação bem mais leve (sem PyTorch no caminho padrão).
+- `transcriber.burn_subtitles` sai; a renderização vai para `clipper.render_clip` (o clipper é o dono do FFmpeg de vídeo).
+- O `.wav` temporário é apagado depois de cada clipe, e `clips/` deixa de guardar vídeos intermediários.
+- As medições de antes e depois estão registradas abaixo.
 
-## Medição (fase 4, 2026-11-17)
-CPU sem GPU (PyTorch 2.15.0+cpu), modelo `small`, clipe real de 30 s em português:
-carregar o modelo 21 s (uma vez por live), transcrição **42 s** (~1,4× o tempo real).
-A qualidade em PT ficou boa (gírias e nomes próprios reconhecidos). A troca para
-faster-whisper continua sendo a principal alavanca de velocidade e deve ser
-reavaliada junto com a otimização "corte e legenda num único encode" (ARCHITECTURE.md §10).
+## Medição antes/depois (2026-11-17, mesma amostra de 30 s, 1080p60, CPU)
+| Etapa | Antes (openai-whisper + 2 encodes) | Depois (faster-whisper int8 + 1 encode) |
+|---|---|---|
+| extrair áudio | — | 1,0 s |
+| transcrição `small` | 61,0 s | **5,9 s** (~10×) |
+| vídeo | corte 31,2 s + queima 39,5 s | render único 32,9 s |
+| **por clipe** | **~132 s** | **~40 s** (~3,3×) |
+| carregar modelo (1×/live) | 9,8 s | 8,0 s |
+
+O encode de vídeo (x264 1080p60) passa a ser o gargalo. A próxima alavanca é a saída em 720p ou vertical 9:16.
+Nota: faster-whisper 1.2.1 é incompatível com PyAV 19 (`metadata_errors`), por isso `av<19` está fixado no requirements.
