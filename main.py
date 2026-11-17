@@ -25,13 +25,14 @@ from pathlib import Path
 
 import config
 import hardware
+import runtime
 from chat_listener import detect_platform
 from engine import (_LOG_FORMAT, JobManager, JobState, JobStatus, _fmt_duration, _fmt_size,
                     _LogFormatter, process_session)
 from session import Session
 
 __all__ = [
-    "PrerequisiteError", "main", "run_jobs", "setup_logging", "check_prerequisites",
+    "PrerequisiteError", "main", "apply_frozen_defaults", "run_jobs", "setup_logging", "check_prerequisites",
 ]
 
 logger = logging.getLogger("auto_clipper")
@@ -66,15 +67,18 @@ def setup_logging(log_file: Path | None = None) -> None:
     if not any(getattr(h, _HANDLER_TAG, None) == "console" for h in root.handlers):
         if sys.platform == "win32":
             for stream in (sys.stdout, sys.stderr):
+                if stream is None:
+                    continue
                 reconfigure = getattr(stream, "reconfigure", None)
                 if reconfigure is not None:
                     try:
                         reconfigure(encoding="utf-8", errors="replace")
                     except (OSError, ValueError):
                         pass
-        console = _tagged(logging.StreamHandler(), "console")
-        console.setFormatter(formatter)
-        root.addHandler(console)
+        if sys.stderr is not None:  # app "windowed": sem console
+            console = _tagged(logging.StreamHandler(), "console")
+            console.setFormatter(formatter)
+            root.addHandler(console)
 
     for handler in list(root.handlers):
         if getattr(handler, _HANDLER_TAG, None) == "file":
@@ -86,10 +90,20 @@ def setup_logging(log_file: Path | None = None) -> None:
         root.addHandler(file_handler)
 
 
+def apply_frozen_defaults() -> None:
+    """Empacotado: a pasta padrão das gravações sai da pasta do programa e vai para Vídeos."""
+    if runtime.is_frozen() and config.SESSIONS_DIR == "sessions":
+        config.SESSIONS_DIR = runtime.default_sessions_dir()
+
+
 def _resolve_ffmpeg_tools() -> None:
     """Garante ffmpeg/ffprobe; no Windows tenta o link do winget (PATH desatualizado)."""
     for attr, exe in (("FFMPEG_BIN", "ffmpeg.exe"), ("FFPROBE_BIN", "ffprobe.exe")):
         current = getattr(config, attr)
+        bundled = runtime.bundled_tool(exe)
+        if bundled:
+            setattr(config, attr, bundled)
+            continue
         if shutil.which(current):
             continue
         localappdata = os.environ.get("LOCALAPPDATA")
@@ -224,6 +238,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="mostra o hardware detectado (GPU/encoder/Whisper) e um mini benchmark")
     args = parser.parse_args(argv)
     urls: list[str] = args.url or [config.STREAM_URL]
+    apply_frozen_defaults()
     setup_logging()
 
     if args.diagnostico:

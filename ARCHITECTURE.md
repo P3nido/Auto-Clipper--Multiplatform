@@ -94,6 +94,8 @@ Dependências fluem num sentido só: `main → (recorder, chat_listener, hype_de
 | `engine.py` | `JobManager`, `JobStatus`, `JobState`, `record_session()`, `process_session()` (ADR-008) | orquestra N lives + fila de clipes |
 | `main.py` | CLI fina sobre o `engine`: várias `--url`, `--once`, `--process`, `--max-duration`, `--diagnostico` | — |
 | `gui.py` | interface PySide6 sobre o `engine` (ADR-008) | UI |
+| `runtime.py` | `is_frozen()`, `app_dir()`, `data_dir()`, `default_sessions_dir()`, `bundled_tool()`, `streamlink_command()`, `subprocess_flags()`, `nvidia_dll_dirs()` (ADR-009) | caminhos do pacote |
+| `launcher_gui.py` / `launcher_cli.py` | entradas do `Auto-Clipper.exe` e do `auto-clipper-cli.exe` (`--run-streamlink`) | — |
 
 Os esqueletos `.py` já contêm as assinaturas, dataclasses e docstrings, e eles são o contrato que o subagente `coder` implementa.
 

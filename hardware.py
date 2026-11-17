@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import config
+import runtime
 
 __all__ = [
     "HardwareProfile",
@@ -71,33 +72,7 @@ class HardwareProfile:
 # DLLs CUDA (cuBLAS/cuDNN instaladas via pip)
 # --------------------------------------------------------------------------
 def _nvidia_bin_dirs() -> list[Path]:
-    roots: list[Path] = []
-    try:
-        spec = importlib.util.find_spec("nvidia")
-    except (ImportError, ValueError):
-        spec = None
-    if spec is not None and spec.submodule_search_locations:
-        roots.extend(Path(p) for p in spec.submodule_search_locations)
-    prefix = Path(sys.prefix)
-    roots.append(prefix / "Lib" / "site-packages" / "nvidia")
-    roots.append(prefix / "lib" / "site-packages" / "nvidia")
-
-    found: list[Path] = []
-    seen: set[str] = set()
-    for root in roots:
-        try:
-            if not root.is_dir():
-                continue
-            children = sorted(root.iterdir())
-        except OSError:
-            continue
-        for child in children:
-            bin_dir = child / "bin"
-            key = os.path.normcase(str(bin_dir))
-            if key not in seen and bin_dir.is_dir():
-                seen.add(key)
-                found.append(bin_dir)
-    return found
+    return runtime.nvidia_dll_dirs()
 
 
 def prepare_cuda_dlls() -> None:
@@ -130,7 +105,7 @@ def _run(cmd: list[str], timeout: float) -> tuple[bool, str]:
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout,
+            timeout=timeout, creationflags=runtime.subprocess_flags(),
         )
     except FileNotFoundError:
         return False, f"{cmd[0]} não encontrado"
@@ -191,7 +166,7 @@ def _gpu_names() -> tuple[str, ...]:
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=_QUERY_TIMEOUT_S,
+                timeout=_QUERY_TIMEOUT_S, creationflags=runtime.subprocess_flags(),
             )
         except (OSError, subprocess.SubprocessError):
             continue
@@ -323,7 +298,7 @@ def _cuda_vram_mib() -> int:
         proc = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=_QUERY_TIMEOUT_S,
+            timeout=_QUERY_TIMEOUT_S, creationflags=runtime.subprocess_flags(),
         )
     except (OSError, subprocess.SubprocessError):
         return 0
@@ -427,6 +402,7 @@ def _ffmpeg_version() -> str:
         proc = subprocess.run(
             [config.FFMPEG_BIN, "-version"], capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=_QUERY_TIMEOUT_S,
+            creationflags=runtime.subprocess_flags(),
         )
         return (proc.stdout.splitlines() or ["?"])[0]
     except (OSError, subprocess.SubprocessError):

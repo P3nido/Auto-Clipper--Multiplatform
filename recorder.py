@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -16,6 +15,7 @@ import time
 from pathlib import Path
 
 import config
+import runtime
 from session import RecordingSegment, Session, now
 
 __all__ = ["RecorderError", "is_live", "Recorder", "remux_to_mp4"]
@@ -28,7 +28,10 @@ _RESUME_CHECK_INTERVAL_S = 10.0  # intervalo entre is_live() ao tentar reabrir
 _READER_JOIN_TIMEOUT_S = 5.0
 _AD_BREAK_RE = re.compile(r"Detected advertisement break of (\d+) seconds?")
 # No Windows, grupo de processos novo: o Ctrl+C do terminal não atinge o streamlink.
-_POPEN_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+_POPEN_FLAGS = (
+    (subprocess.CREATE_NEW_PROCESS_GROUP | runtime.subprocess_flags())
+    if sys.platform == "win32" else 0
+)
 
 
 class RecorderError(RuntimeError):
@@ -62,19 +65,15 @@ def is_live(url: str) -> bool:
     return bool(streams)
 
 
-def _find_streamlink() -> str:
-    """Executável do streamlink: ao lado do Python atual, senão no PATH."""
-    name = "streamlink.exe" if sys.platform == "win32" else "streamlink"
-    local = Path(sys.executable).parent / name
-    if local.is_file():
-        return str(local)
-    found = shutil.which("streamlink")
-    if found:
-        return found
-    raise RecorderError(
-        "Executável do streamlink não encontrado. Instale com `pip install streamlink` "
-        "no mesmo ambiente do Python ou coloque-o no PATH."
-    )
+def _find_streamlink() -> list[str]:
+    """Prefixo do comando do streamlink (runtime.streamlink_command)."""
+    try:
+        return runtime.streamlink_command()
+    except FileNotFoundError as exc:
+        raise RecorderError(
+            "Executável do streamlink não encontrado. Instale com `pip install streamlink` "
+            f"no mesmo ambiente do Python ou coloque-o no PATH. ({exc})"
+        ) from exc
 
 
 class Recorder:
@@ -165,7 +164,7 @@ class Recorder:
     def _record_segment(self, segment: RecordingSegment) -> int:
         """Executa um processo streamlink para um segmento e retorna o exit code."""
         cmd = [
-            _find_streamlink(),
+            *_find_streamlink(),
             self.session.url,
             config.STREAM_QUALITY,
             "-o",
@@ -243,7 +242,8 @@ def remux_to_mp4(ts_path: Path) -> Path:
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=runtime.subprocess_flags(),
         )
     except FileNotFoundError as exc:
         raise RecorderError(

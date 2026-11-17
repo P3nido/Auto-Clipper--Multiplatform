@@ -36,6 +36,8 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+_MODEL_LOADING_MESSAGE = "Preparando as legendas (na primeira vez o modelo é baixado)"
+
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s"
 _SESSION_LOG_TAG = "_auto_clipper_session_log"
 _POLL_SLICE_S = 0.5
@@ -302,7 +304,7 @@ def process_session(session, *, model_cache: dict | None = None,
 def _process_into(session: Session, model_cache: dict | None,
                   on_progress: Callable[[dict], None] | None,
                   stop_event: threading.Event | None) -> list[Path]:
-    def emit(**info: int) -> None:
+    def emit(**info: object) -> None:
         if on_progress is None:
             return
         try:
@@ -338,6 +340,8 @@ def _process_into(session: Session, model_cache: dict | None,
 
     total = len(specs)
     emit(spikes=len(spikes), clips_done=0, clips_total=total)
+    if model_cache is None or "model" not in model_cache:
+        emit(spikes=len(spikes), clips_done=0, clips_total=total, message=_MODEL_LOADING_MESSAGE)
     try:
         model = _get_model(model_cache)
     except Exception as exc:  # noqa: BLE001
@@ -683,7 +687,9 @@ class JobManager:
             def on_post(info: dict) -> None:
                 done = int(info.get("clips_done", 0))
                 total = int(info.get("clips_total", 0))
-                if total > 0 and done < total:
+                if info.get("message"):
+                    message = str(info["message"])
+                elif total > 0 and done < total:
                     message = f"Gerando clipe {done + 1} de {total}"
                 elif total > 0:
                     message = "Finalizando os clipes"

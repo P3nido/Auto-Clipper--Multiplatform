@@ -20,3 +20,7 @@ Thumbs.db
 
 # Ajustes da interface (por máquina)
 settings.json
+
+# PyInstaller
+build/
+dist/

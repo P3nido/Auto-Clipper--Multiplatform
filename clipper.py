@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import config
+import runtime
 import hardware
 from hype_detector import Spike
 
@@ -152,7 +153,8 @@ def build_video_filter(
 def _run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=cwd
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=cwd,
+            creationflags=runtime.subprocess_flags(),
         )
     except FileNotFoundError as exc:
         raise ClipperError(

@@ -111,6 +111,17 @@ Para quem não quer mexer em terminal: cole o link da live e deixe rodar.
 - `python gui.py --demo` mostra a interface com lives simuladas, sem gravar nada.
 - Sem FFmpeg instalado, a tela avisa e mostra o comando `winget install Gyan.FFmpeg`.
 
+## Executável (Windows, sem instalar nada)
+
+Gere a pasta pronta para usar em qualquer PC Windows (ADR-009):
+
+```powershell
+.venv\Scripts\python -m pip install -r requirements-dev.txt -r requirements-gpu.txt
+.venv\Scripts\python build_exe.py
+```
+
+O resultado fica em `dist\Auto-Clipper\` (~2,8 GB, com FFmpeg, Streamlink, faster-whisper e CUDA embutidos). Copie a pasta para o outro PC e dê dois cliques em **`Auto-Clipper.exe`**. `auto-clipper-cli.exe --diagnostico` mostra a GPU e o encoder detectados. Os clipes vão para `Vídeos\Auto-Clipper` e os ajustes para `%LOCALAPPDATA%\Auto-Clipper`.
+
 ## Dicas
 
 - **Formato do clipe:** `OUTPUT_LAYOUT = "vertical_blur"` (padrão: vídeo inteiro sobre fundo desfocado, nada da tela é perdido), `"vertical_crop"` (tela cheia, corta as laterais e costuma cortar a webcam) ou `"horizontal"` (16:9 como a live).

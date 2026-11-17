@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 import config
+import runtime
 from chat_listener import channel_from_url, detect_platform
 from engine import JobState, JobStatus
 
@@ -73,7 +74,7 @@ GB = 1024 ** 3
 MB = 1024 ** 2
 SHUTDOWN_TIMEOUT_S = 90
 
-SETTINGS_PATH = Path(__file__).resolve().parent / "settings.json"
+SETTINGS_PATH = runtime.data_dir() / "settings.json"
 EXAMPLE_URL = "https://www.twitch.tv/nome_do_canal"
 FFMPEG_INSTALL_CMD = "winget install Gyan.FFmpeg"
 
@@ -978,12 +979,42 @@ def create_app(argv: list[str] | None = None) -> QApplication:
 
 
 # ─────────────────────────────────── entrada ─────────────────────────────────
+_LOG_FILE_BYTES = 5 * 1024 * 1024
+_LOG_FILE_BACKUPS = 3
+_GUI_LOG_FORMAT = "%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s"
+
+
+def setup_gui_logging() -> None:
+    """Console (se existir; app "windowed" não tem stderr) + app.log rotativo quando
+    empacotado, onde não há terminal para ver os logs."""
+    from logging.handlers import RotatingFileHandler
+
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, str(config.LOG_LEVEL).upper(), logging.INFO))
+    formatter = logging.Formatter(_GUI_LOG_FORMAT)
+    if sys.stderr is not None and not root.handlers:
+        console = logging.StreamHandler()
+        console.setFormatter(formatter)
+        root.addHandler(console)
+    if runtime.is_frozen():
+        try:
+            file_handler = RotatingFileHandler(
+                runtime.data_dir() / "app.log", maxBytes=_LOG_FILE_BYTES,
+                backupCount=_LOG_FILE_BACKUPS, encoding="utf-8",
+            )
+        except OSError:
+            return
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Auto-Clipper (interface gráfica)")
     parser.add_argument("--demo", action="store_true", help="usa lives simuladas (não grava nada)")
     args = parser.parse_args(argv)
-    logging.basicConfig(level=getattr(logging, str(config.LOG_LEVEL).upper(), logging.INFO),
-                        format="%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s")
+    setup_gui_logging()
+    if runtime.is_frozen() and config.SESSIONS_DIR == "sessions":
+        config.SESSIONS_DIR = runtime.default_sessions_dir()
     app = create_app()
 
     if args.demo:
