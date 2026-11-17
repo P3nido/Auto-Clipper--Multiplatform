@@ -1,0 +1,19 @@
+# Saída das gravações (vídeos grandes)
+sessions/
+*.ts
+*.mp4
+*.srt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Claude Code: configurações locais
+.claude/settings.local.json
+
+# SO
+.DS_Store
+Thumbs.db

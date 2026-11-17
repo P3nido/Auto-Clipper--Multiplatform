@@ -1,0 +1,16 @@
+# Auto-Clipper Multiplataforma — dependências de execução (Python 3.10+)
+#
+# Ferramentas EXTERNAS (não vêm pelo pip, precisam estar no PATH):
+#   - FFmpeg + FFprobe   → winget install Gyan.FFmpeg
+#   - Google Chrome/Chromium → só para Kick (Streamlink resolve o desafio do Cloudflare)
+
+# Etapa 1: gravação. Versão fixada porque o parser de anúncios lê o log dele (ADR-004)
+streamlink==8.6.3
+
+# Etapa 2: chat
+chat-downloader==0.2.8        # YouTube (ADR-002)
+websocket-client>=1.9,<2      # Kick (Pusher)
+curl_cffi>=0.17,<1            # Kick (API do canal atrás do Cloudflare)
+
+# Etapa 5: transcrição (puxa PyTorch, a primeira instalação é pesada)
+openai-whisper==20250625
