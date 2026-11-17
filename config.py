@@ -32,9 +32,9 @@ RECORDING_RESUME_GRACE_S = 90
 
 # --- Etapa 2: chat ------------------------------------------------------
 CHAT_RECONNECT_MAX_BACKOFF_S = 60   # espera máxima entre tentativas de reconexão
-# Chave pública do app Pusher usado pelo chat da Kick (pode mudar com o tempo).
-KICK_PUSHER_KEY = "32cbd69e4b950bf97679"
-KICK_PUSHER_CLUSTER = "us2"
+KICK_POLL_INTERVAL_S = 1.5          # consulta ao histórico do chat da Kick
+KICK_MAX_BACKFILL_PAGES = 10        # páginas extras (25 msgs cada) se o chat acelerar
+YOUTUBE_MAX_POLL_INTERVAL_S = 5.0   # teto da espera entre consultas ao chat do YouTube
 
 # --- Etapa 3: detecção de picos ----------------------------------------
 BUCKET_SECONDS = 10             # tamanho de cada bloco de contagem

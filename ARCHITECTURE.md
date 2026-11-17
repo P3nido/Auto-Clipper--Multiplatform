@@ -82,7 +82,7 @@ Dependências fluem num sentido só: `main → (recorder, chat_listener, hype_de
 |---|---|---|
 | `session.py` | `Session`, `RecordingSegment`, `now()` | disco (manifesto) |
 | `recorder.py` | `is_live(url)`, `Recorder`, `remux_to_mp4()`, `RecorderError` | subprocess, disco |
-| `chat_listener.py` | `ChatMessage`, `ChatSource` (+ `TwitchIRCSource`, `KickPusherSource`, `ChatDownloaderSource`), `detect_platform()`, `channel_from_url()`, `make_chat_source()`, `ChatListener` | rede, disco |
+| `chat_listener.py` | `ChatMessage`, `ChatSource` (+ `TwitchIRCSource`, `KickHistorySource`, `YouTubeInnerTubeSource`), `detect_platform()`, `channel_from_url()`, `make_chat_source()`, `ChatListener` | rede, disco |
 | `hype_detector.py` | `Spike`, `bucketize()`, `detect_spike_buckets()`, `find_spikes()` | só `find_spikes` lê disco |
 | `clipper.py` | `ClipSpec`, `plan_clips()`, `cut_clip()`, `probe_duration()`, `ClipperError` | subprocess |
 | `transcriber.py` | `load_model()`, `transcribe_to_srt()`, `burn_subtitles()`, `TranscriberError` | modelo, subprocess |
@@ -127,9 +127,11 @@ Ver [ADR-002](docs/adr/ADR-002-adaptadores-de-chat.md). Todas as plataformas pro
 
 | Plataforma | Adaptador | Como funciona | Dependência |
 |---|---|---|---|
-| Twitch | `TwitchIRCSource` | IRC anônimo (`NICK justinfan<n>`) em `irc.chat.twitch.tv:6667`, responde `PING` | só stdlib (`socket`) |
-| Kick | `KickPusherSource` | busca o `chatroom.id` em `kick.com/api/v2/channels/<slug>` e assina `chatrooms.<id>.v2` no WebSocket Pusher | `curl_cffi` (Cloudflare) + `websocket-client` |
-| YouTube | `ChatDownloaderSource` | `chat-downloader` (InnerTube) | `chat-downloader` |
+| Twitch | `TwitchIRCSource` | IRC anônimo (`NICK justinfan<n>`, tags) em `irc.chat.twitch.tv:6667`, responde `PING` | só stdlib (`socket`) |
+| Kick | `KickHistorySource` | consulta `web.kick.com/api/v1/chat/<channel_id>/history` a cada 1,5 s e pagina pelo `cursor` quando o chat acelera (o Pusher foi desativado) | `curl_cffi` (Cloudflare) |
+| YouTube | `YouTubeInnerTubeSource` | InnerTube: `/live_chat` + `youtubei/v1/live_chat/get_live_chat` seguindo as continuations (o chat-downloader está quebrado) | `curl_cffi` |
+
+O `wall_ts` de cada mensagem é o instante de **envio** informado pela plataforma (`tmi-sent-ts`, `created_at`, `timestampUsec`), e não o de recepção. Os adaptadores por consulta recebem em lotes, e usar a recepção agruparia mensagens em blocos errados.
 
 Reconexão: o `ChatListener` envolve qualquer fonte com backoff exponencial de 1 s até `CHAT_RECONNECT_MAX_BACKOFF_S`, registrando cada queda no log. Lacunas no chat aparecem como blocos com 0 mensagens, o que **reduz** a linha de base e nunca gera pico falso.
 
@@ -153,8 +155,8 @@ Reconexão: o `ChatListener` envolve qualquer fonte com backoff exponencial de 1
 
 ## 10. Riscos conhecidos
 
-1. **`chat-downloader` sem release desde set/2023.** O YouTube pode ter quebrado o InnerTube. *Mitigação:* o primeiro passo da implementação é um spike de validação, e há um adaptador próprio InnerTube como plano B.
-2. **Kick + Cloudflare:** tanto a gravação (Streamlink precisa de Chrome/Chromium) quanto o chat (`curl_cffi`) dependem de passar pelo desafio. A chave Pusher pública da Kick pode mudar, e por isso ela fica em `config.py`.
+1. **Endpoints internos (Kick e YouTube)** não são documentados e podem mudar sem aviso. Isso já aconteceu duas vezes: o `chat-downloader` quebrou e a Kick desativou o Pusher (ver ADR-002). *Mitigação:* adaptadores pequenos e isolados, erro claro no log e a gravação independente do chat.
+2. **Kick + Cloudflare:** tanto a gravação (Streamlink precisa de Chrome/Chromium) quanto o chat (`curl_cffi` imitando o Chrome) dependem de passar pelo desafio.
 3. **Disco:** medido na fase 2 (Twitch 1080p60 em `best`): cerca de 0,83 MB/s, ou seja, **~3 GB por hora** e ~12 GB numa live de 4 h. Para reduzir, use `STREAM_QUALITY = "720p"` ou `DELETE_RAW_AFTER_PROCESS`.
 4. **CPU:** o Whisper `small` em CPU leva aproximadamente de 1× a 2× o tempo real por clipe. 20 clipes de 30 s levam uns 10–20 min.
 
@@ -165,6 +167,6 @@ Reconexão: o `ChatListener` envolve qualquer fonte com backoff exponencial de 1
 | 0 | Base: arquitetura, esqueletos, config, agents, skills | orquestrador ✅ |
 | 1 | `hype_detector` + `clipper.plan_clips` + `wall_to_offset` (puros) com testes verdes | coder → qa-explorer ✅ |
 | 2 | `session` + `recorder` (gravar uma live real da Twitch por 2 min) | coder → qa-explorer ✅ (90 s reais gravados, TS válido, stop em < 1 s) |
-| 3 | `chat_listener`: Twitch IRC → Kick → spike do YouTube | coder → qa-explorer |
+| 3 | `chat_listener`: Twitch IRC → Kick → spike do YouTube | coder → qa-explorer ✅ (chat real: Twitch 38 msgs/40 s, Kick 88 msgs/75 s com 1 reconexão, YouTube 7 msgs/75 s) |
 | 4 | `clipper.cut_clip` + `transcriber` (com um `.ts` de amostra) | coder → qa-explorer |
 | 5 | `main`: loop, Ctrl+C, `--process`, `--once`, teste ponta a ponta | coder → qa-explorer → revisão |

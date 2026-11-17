@@ -3,7 +3,7 @@
 **Status:** Aceito · **Data:** 2026-11-17
 
 ## Contexto
-A gravação e o chat precisam rodar simultaneamente e encerrar juntos. A gravação é um subprocess (streamlink). As fontes de chat são bloqueantes (`socket`, `websocket-client`, gerador do `chat-downloader`).
+A gravação e o chat precisam rodar simultaneamente e encerrar juntos. A gravação é um subprocess (streamlink). As fontes de chat são bloqueantes (`socket` do IRC e consultas HTTP com `curl_cffi`).
 
 ## Opções
 - **asyncio:** exigiria envolver as bibliotecas bloqueantes em `to_thread`, então seriam threads de qualquer forma, com mais complexidade.

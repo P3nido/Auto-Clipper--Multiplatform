@@ -7,7 +7,7 @@ Monitora um canal da **Twitch**, **YouTube** ou **Kick** só pela URL, grava a l
 ## Pipeline
 
 1. **Monitorar e gravar:** a cada 30 s verifica se a live está no ar e grava em `best` com o Streamlink.
-2. **Capturar o chat:** em paralelo e de forma anônima (IRC da Twitch, Pusher da Kick, chat-downloader no YouTube).
+2. **Capturar o chat:** em paralelo e de forma anônima (IRC da Twitch, histórico do chat da Kick e API interna do chat do YouTube).
 3. **Detectar picos:** blocos de 10 s, média móvel, limiar de `SPIKE_MULTIPLIER`× e cooldown.
 4. **Recortar:** 15 s antes e 15 s depois de cada pico, com o FFmpeg.
 5. **Legendar:** Whisper local gera o `.srt`, e o FFmpeg queima a legenda no vídeo final.
