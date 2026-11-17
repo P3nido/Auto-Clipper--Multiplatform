@@ -56,7 +56,7 @@ AUDIO_BITRATE = "160k"          # áudio AAC dos clipes
 
 # --- Etapa 5: transcrição e legenda -------------------------------------
 WHISPER_ENGINE = "openai"       # "openai" (padrão). "faster" fica reservado (ADR-005)
-WHISPER_LANGUAGE = "pt"
+WHISPER_LANGUAGE: str | None = "pt"  # None = detecta o idioma automaticamente (lives em outras línguas)
 SUBTITLE_STYLE = (
     "FontName=Arial,FontSize=16,Bold=1,PrimaryColour=&H00FFFFFF,"
     "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,"

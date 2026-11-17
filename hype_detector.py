@@ -7,10 +7,12 @@ Algoritmo detalhado: ARCHITECTURE.md §5.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import config
 from session import Session
@@ -97,9 +99,74 @@ def detect_spike_buckets(
     return peaks
 
 
+def _read_chat_timestamps(path: Path) -> list[float]:
+    """Lê wall_ts de cada linha válida de chat.jsonl (inválidas são puladas)."""
+    timestamps: list[float] = []
+    invalid = 0
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                ts = float(data["wall_ts"])
+                if not math.isfinite(ts):
+                    raise ValueError("wall_ts não finito")
+            except (ValueError, KeyError, TypeError):
+                invalid += 1
+                continue
+            timestamps.append(ts)
+    if invalid:
+        logger.warning("chat.jsonl: %d linha(s) inválida(s) puladas", invalid)
+    return timestamps
+
+
 def find_spikes(session: Session) -> list[Spike]:
     """Lê session.chat_path, aplica CHAT_DELAY_OFFSET_S, separa as mensagens por
     segmento, roda bucketize + detect_spike_buckets com os valores de config e
     converte cada pico com segment.wall_to_offset() (picos em anúncio são
     descartados). Grava session.spikes_path e retorna a lista."""
-    raise NotImplementedError
+    spikes: list[Spike] = []
+    records: list[dict] = []
+    if not session.chat_path.exists():
+        logger.warning("Sem chat.jsonl em %s: nenhum pico detectado", session.root)
+    else:
+        adjusted = [t - config.CHAT_DELAY_OFFSET_S for t in _read_chat_timestamps(session.chat_path)]
+        bucket_s = config.BUCKET_SECONDS
+        for seg in session.segments:
+            if seg.wall_start is None:
+                logger.debug("Segmento %d sem wall_start: ignorado", seg.index)
+                continue
+            end = seg.wall_end
+            if end is None:
+                later = [t for t in adjusted if t >= seg.wall_start]
+                end = max(later) if later else seg.wall_start
+            in_seg = [t for t in adjusted if seg.wall_start <= t < end]
+            counts = bucketize(in_seg, seg.wall_start, end, bucket_s)
+            peaks = detect_spike_buckets(
+                counts,
+                bucket_s=bucket_s,
+                multiplier=config.SPIKE_MULTIPLIER,
+                baseline_window=config.BASELINE_WINDOW_BUCKETS,
+                warmup=config.WARMUP_BUCKETS,
+                min_messages=config.MIN_MESSAGES_PER_BUCKET,
+                cooldown_s=config.SPIKE_COOLDOWN_S,
+            )
+            for idx, baseline in peaks:
+                center = seg.wall_start + (idx + 0.5) * bucket_s
+                offset = seg.wall_to_offset(center)
+                if offset is None:
+                    logger.debug("Pico no bloco %d do segmento %d descartado (anúncio/fora)", idx, seg.index)
+                    continue
+                spikes.append(Spike(seg.index, offset, counts[idx], baseline))
+                records.append({
+                    "segment_index": seg.index,
+                    "video_offset_s": offset,
+                    "count": counts[idx],
+                    "baseline": baseline,
+                    "wall_ts": center,
+                })
+    session.spikes_path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("%d pico(s) detectado(s)", len(spikes))
+    return spikes

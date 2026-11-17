@@ -2,7 +2,7 @@
 
 Monitora um canal da **Twitch**, **YouTube** ou **Kick** só pela URL, grava a live automaticamente, encontra os momentos de maior engajamento no chat, recorta clipes de 30 s e queima legendas geradas localmente pelo Whisper. É **100% gratuito e local**: não precisa de conta, token nem chave de API.
 
-> 🚧 **Status:** fase 0 (base de arquitetura). Os módulos ainda são esqueletos com contratos e testes. Veja o roteiro em [ARCHITECTURE.md §11](ARCHITECTURE.md#11-roteiro-de-implementação).
+> ✅ **Status:** v1 funcional, com as 5 etapas implementadas e validadas em lives reais (Twitch, Kick e YouTube) e 125 testes. Próximos passos de desempenho em [ARCHITECTURE.md §10](ARCHITECTURE.md#10-riscos-conhecidos).
 
 ## Pipeline
 
@@ -43,8 +43,20 @@ python main.py
 | `python main.py --once` | encerra depois da primeira live |
 | `python main.py --url https://kick.com/canal` | ignora a URL do `config.py` |
 | `python main.py --process sessions/<pasta>` | refaz só os clipes de uma gravação já feita |
+| `python main.py --max-duration 3600` | para de gravar depois de N segundos e processa o que gravou |
 
-Os resultados ficam em `sessions/<data>_<plataforma>_<canal>/final/`.
+**Ctrl+C** durante a gravação para tudo de forma limpa e ainda gera os clipes do que foi gravado.
+
+Os resultados ficam em `sessions/<data>_<plataforma>_<canal>/final/`, com os nomes `clip_01_seg0_12m30s.mp4` (posição no vídeo gravado). O log completo fica no `run.log` da mesma pasta.
+
+## Dicas
+
+- **Live em outro idioma:** use `WHISPER_LANGUAGE = None` em `config.py` para o Whisper detectar o idioma. Forçar `"pt"` numa live em francês gera legenda vazia ou sem sentido.
+- **Poucos ou muitos clipes:** ajuste `SPIKE_MULTIPLIER` (menor = mais sensível) e `MIN_MESSAGES_PER_BUCKET` (piso para chats pequenos).
+- **Clipe começa tarde demais:** o chat reage depois do lance. Aumente `CLIP_PRE_S` ou `CHAT_DELAY_OFFSET_S`.
+- **Tempo de processamento:** em CPU, cada clipe de 30 s em 1080p leva ~1 min 45 s com o modelo `small`. O modelo `base` é ~2× mais rápido, com legenda um pouco pior.
+- **Disco:** ~3 GB por hora em `best`. Use `STREAM_QUALITY = "720p"` ou `DELETE_RAW_AFTER_PROCESS = True`.
+- **FFmpeg recém-instalado:** se o terminal ainda não enxerga o `ffmpeg`, o programa encontra sozinho o atalho do winget.
 
 ## Estrutura
 

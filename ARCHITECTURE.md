@@ -172,4 +172,4 @@ Reconexão: o `ChatListener` envolve qualquer fonte com backoff exponencial de 1
 | 2 | `session` + `recorder` (gravar uma live real da Twitch por 2 min) | coder → qa-explorer ✅ (90 s reais gravados, TS válido, stop em < 1 s) |
 | 3 | `chat_listener`: Twitch IRC → Kick → spike do YouTube | coder → qa-explorer ✅ (chat real: Twitch 38 msgs/40 s, Kick 88 msgs/75 s com 1 reconexão, YouTube 7 msgs/75 s) |
 | 4 | `clipper.cut_clip` + `transcriber` (com um `.ts` de amostra) | coder → qa-explorer ✅ (clipe real legendado em PT; ~107 s/clipe em CPU) |
-| 5 | `main`: loop, Ctrl+C, `--process`, `--once`, teste ponta a ponta | coder → qa-explorer → revisão |
+| 5 | `main`: loop, Ctrl+C, `--process`, `--once`, teste ponta a ponta | coder → qa-explorer → revisão ✅ (live real → 2 picos → 2 clipes legendados) |
