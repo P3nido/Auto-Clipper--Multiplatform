@@ -26,6 +26,9 @@ WHISPER_MODEL = "small"
 POLL_INTERVAL_S = 30            # intervalo entre checagens de "está ao vivo?"
 STREAM_QUALITY = "best"         # qualidade do streamlink ("best", "720p", "480p"...)
 STREAMLINK_EXTRA_ARGS: list[str] = []  # ex.: ["--kick-low-latency"]
+# Se o streamlink cair, por quanto tempo seguir tentando reabrir a gravação
+# antes de considerar que a live acabou (streamer caiu e voltou, rede oscilou).
+RECORDING_RESUME_GRACE_S = 90
 
 # --- Etapa 2: chat ------------------------------------------------------
 CHAT_RECONNECT_MAX_BACKOFF_S = 60   # espera máxima entre tentativas de reconexão

@@ -155,7 +155,7 @@ Reconexão: o `ChatListener` envolve qualquer fonte com backoff exponencial de 1
 
 1. **`chat-downloader` sem release desde set/2023.** O YouTube pode ter quebrado o InnerTube. *Mitigação:* o primeiro passo da implementação é um spike de validação, e há um adaptador próprio InnerTube como plano B.
 2. **Kick + Cloudflare:** tanto a gravação (Streamlink precisa de Chrome/Chromium) quanto o chat (`curl_cffi`) dependem de passar pelo desafio. A chave Pusher pública da Kick pode mudar, e por isso ela fica em `config.py`.
-3. **Disco:** uma live de 4 h em `best` (1080p60) ocupa cerca de 6–8 GB. Há a opção `DELETE_RAW_AFTER_PROCESS`.
+3. **Disco:** medido na fase 2 (Twitch 1080p60 em `best`): cerca de 0,83 MB/s, ou seja, **~3 GB por hora** e ~12 GB numa live de 4 h. Para reduzir, use `STREAM_QUALITY = "720p"` ou `DELETE_RAW_AFTER_PROCESS`.
 4. **CPU:** o Whisper `small` em CPU leva aproximadamente de 1× a 2× o tempo real por clipe. 20 clipes de 30 s levam uns 10–20 min.
 
 ## 11. Roteiro de implementação
@@ -164,7 +164,7 @@ Reconexão: o `ChatListener` envolve qualquer fonte com backoff exponencial de 1
 |---|---|---|
 | 0 | Base: arquitetura, esqueletos, config, agents, skills | orquestrador ✅ |
 | 1 | `hype_detector` + `clipper.plan_clips` + `wall_to_offset` (puros) com testes verdes | coder → qa-explorer ✅ |
-| 2 | `session` + `recorder` (gravar uma live real da Twitch por 2 min) | coder → qa-explorer |
+| 2 | `session` + `recorder` (gravar uma live real da Twitch por 2 min) | coder → qa-explorer ✅ (90 s reais gravados, TS válido, stop em < 1 s) |
 | 3 | `chat_listener`: Twitch IRC → Kick → spike do YouTube | coder → qa-explorer |
 | 4 | `clipper.cut_clip` + `transcriber` (com um `.ts` de amostra) | coder → qa-explorer |
 | 5 | `main`: loop, Ctrl+C, `--process`, `--once`, teste ponta a ponta | coder → qa-explorer → revisão |

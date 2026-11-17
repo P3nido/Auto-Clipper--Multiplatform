@@ -11,6 +11,7 @@ import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Protocol
+from urllib.parse import parse_qs, urlparse
 
 import config
 from session import Session
@@ -91,14 +92,64 @@ class ChatDownloaderSource:
         raise NotImplementedError
 
 
+_TWITCH_HOSTS = {"twitch.tv"}
+_KICK_HOSTS = {"kick.com"}
+_YOUTUBE_HOSTS = {"youtube.com", "youtu.be"}
+_TWITCH_RESERVED = {"videos", "directory", "downloads", "settings", "p", "popout"}
+
+
+def _parse_url(url: str) -> tuple[str, list[str], dict[str, list[str]]]:
+    """(host sem www./m., segmentos do caminho, query). ValueError se vazia."""
+    raw = url.strip()
+    if "//" not in raw:
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    for prefix in ("www.", "m."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    if not host:
+        raise ValueError(f"URL inválida: {url!r}")
+    segments = [seg for seg in parsed.path.split("/") if seg]
+    return host, segments, parse_qs(parsed.query)
+
+
 def detect_platform(url: str) -> str:
     """"twitch" | "youtube" | "kick" pelo host da URL. ValueError se não suportada."""
-    raise NotImplementedError
+    host, _, _ = _parse_url(url)
+    if host in _TWITCH_HOSTS:
+        return "twitch"
+    if host in _KICK_HOSTS:
+        return "kick"
+    if host in _YOUTUBE_HOSTS:
+        return "youtube"
+    raise ValueError(f"Plataforma não suportada: {url!r}")
 
 
 def channel_from_url(url: str) -> str:
     """Nome do canal/slug a partir da URL (twitch.tv/<x>, kick.com/<x>, youtube @handle)."""
-    raise NotImplementedError
+    platform = detect_platform(url)
+    host, segments, query = _parse_url(url)
+    if platform in ("twitch", "kick"):
+        if not segments or (platform == "twitch" and segments[0].lower() in _TWITCH_RESERVED):
+            raise ValueError(f"URL sem canal: {url!r}")
+        return segments[0]
+    # YouTube
+    if host == "youtu.be":
+        if segments:
+            return segments[0]
+    elif segments:
+        first = segments[0]
+        if first.startswith("@"):
+            if len(first) > 1:
+                return first[1:]
+        elif first == "channel" and len(segments) >= 2:
+            return segments[1]
+        elif first == "watch" and query.get("v"):
+            return query["v"][0]
+        elif first in ("live", "shorts") and len(segments) >= 2:
+            return segments[1]
+    raise ValueError(f"URL do YouTube sem canal/vídeo reconhecível: {url!r}")
 
 
 def make_chat_source(url: str) -> ChatSource:
