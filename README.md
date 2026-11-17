@@ -12,30 +12,62 @@ Monitora um canal da **Twitch**, **YouTube** ou **Kick** só pela URL, grava a l
 4. **Recortar:** 15 s antes e 15 s depois de cada pico, com o FFmpeg.
 5. **Legendar:** Whisper local gera o `.srt`, e o FFmpeg queima a legenda no vídeo final.
 
-## Pré-requisitos
+## Instalação do zero (Windows)
 
-| Ferramenta | Para quê | Como instalar (Windows) |
-|---|---|---|
-| Python 3.10+ | tudo | python.org |
-| **FFmpeg + FFprobe no PATH** | recorte e legendas | `winget install Gyan.FFmpeg` |
-| Google Chrome ou Chromium | só **Kick** (desafio do Cloudflare) | já instalado na maioria das máquinas |
+Testado clonando o repositório numa pasta limpa: a instalação leva ~3 min e ocupa ~370 MB (sem PyTorch).
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+**1. Programas do sistema** (uma vez por máquina, no PowerShell):
+
+```powershell
+winget install Python.Python.3.13
+winget install Git.Git
+winget install Gyan.FFmpeg
 ```
 
-O modelo do Whisper (faster-whisper) é baixado no primeiro uso, ~460 MB para o `small`. O motor openai-whisper é opcional e puxa o PyTorch (veja requirements.txt).
+- **Python 3.10 ou mais novo.** Se instalar pelo site python.org, marque **"Add python.exe to PATH"**.
+- **FFmpeg + FFprobe:** usados no recorte e nas legendas. Depois do winget, **feche e reabra o terminal** para o `ffmpeg` entrar no PATH. Se esquecer, o programa encontra sozinho o atalho do winget.
+- **Google Chrome ou Chromium:** só para **Kick**, por causa do desafio do Cloudflare.
+
+**2. Projeto e dependências Python:**
+
+```powershell
+git clone https://github.com/P3nido/Auto-Clipper--Multiplatform.git auto-clipper
+cd auto-clipper
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+Os comandos chamam `.venv\Scripts\python` direto, sem `activate`. Assim não esbarram na política de execução de scripts do PowerShell.
+
+**3. Conferir a instalação** (opcional):
+
+```powershell
+.venv\Scripts\python -m pip install -r requirements-dev.txt
+.venv\Scripts\python -m pytest -q tests/
+```
+
+**4. Primeiro teste rápido**, com uma live que esteja no ar agora: grava 3 minutos e gera os clipes do trecho.
+
+```powershell
+.venv\Scripts\python main.py --once --url https://kick.com/CANAL --max-duration 180
+```
+
+Na primeira execução, o modelo do Whisper é baixado automaticamente (~460 MB para o `small`). Num trecho curto pode não sair nenhum clipe, porque o detector precisa de alguns minutos de chat para formar a média. O teste valida a gravação e o chat. Para ver clipes, deixe gravar mais tempo.
+
+> **Linux/macOS:** instale `ffmpeg` pelo gerenciador de pacotes (`apt install ffmpeg` / `brew install ffmpeg`) e use `.venv/bin/python` no lugar de `.venv\Scripts\python`.
+>
+> **Motor openai-whisper** (opcional): `pip install openai-whisper` e `WHISPER_ENGINE = "openai"` no `config.py`. Ele puxa o PyTorch (~1 GB).
 
 ## Uso
 
 1. Abra `config.py` e preencha `STREAM_URL`. Se quiser, ajuste `SPIKE_MULTIPLIER` e `WHISPER_MODEL`.
 2. Rode:
 
-```bash
-python main.py
+```powershell
+.venv\Scripts\python main.py
 ```
+
+Nos exemplos abaixo, `python` = `.venv\Scripts\python`.
 
 | Comando | Efeito |
 |---|---|
