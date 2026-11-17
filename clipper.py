@@ -17,7 +17,7 @@ from hype_detector import Spike
 
 __all__ = [
     "ClipperError", "ClipSpec", "plan_clips", "probe_duration",
-    "extract_audio", "render_clip", "cut_clip",
+    "extract_audio", "render_clip", "cut_clip", "build_video_filter",
 ]
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,56 @@ def plan_clips(
         ranked = sorted(clips, key=lambda c: (-c.peak_count, c.segment_index, c.start_s))
         clips = sorted(ranked[:max_clips], key=lambda c: (c.segment_index, c.start_s))
     return clips
+
+
+_VERTICAL_LAYOUTS = ("vertical_blur", "vertical_crop")
+_VALID_LAYOUTS = (*_VERTICAL_LAYOUTS, "horizontal")
+# O desfoque roda numa versão reduzida (1/_BLUR_DOWNSCALE) do quadro: muito mais barato.
+_BLUR_DOWNSCALE = 4
+_BLUR_FILTER = "boxblur=10:2"
+
+
+def build_video_filter(
+    layout: str,
+    srt_name: str | None,
+    *,
+    size: tuple[int, int],
+    fps: int | None,
+    style: str,
+) -> str:
+    """Monta o filtergraph (-filter_complex) com entrada [0:v] e saída rotulada [v].
+
+    Função PURA. Ordem: fps (se não None) -> layout -> subtitles (se srt_name).
+    O fps vem PRIMEIRO para que escala/desfoque/overlay processem só os quadros
+    que vão para a saída (metade, numa live de 60 fps).
+    Layouts: "vertical_blur", "vertical_crop", "horizontal". Outro valor -> ValueError."""
+    if layout not in _VALID_LAYOUTS:
+        raise ValueError(f"layout inválido: {layout!r} (use um de {', '.join(_VALID_LAYOUTS)})")
+    w, h = size
+    steps: list[str] = [f"fps={fps}"] if fps is not None else []
+
+    if layout == "vertical_blur":
+        sw, sh = w // _BLUR_DOWNSCALE, h // _BLUR_DOWNSCALE
+        steps.append("split=2[bg][fg]")
+        head = (
+            "[0:v]" + ",".join(steps) + ";"
+            f"[bg]scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh},"
+            f"{_BLUR_FILTER},scale={w}:{h},setsar=1[bgb];"
+            f"[fg]scale={w}:-2,setsar=1[fgs];"
+            f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2"
+        )
+        steps = []
+    else:
+        if layout == "vertical_crop":
+            steps.append(f"crop=trunc(ih*{w}/{h}/2)*2:ih,scale={w}:{h},setsar=1")
+        head = "[0:v]"
+
+    if srt_name:
+        extra = f":original_size={w}x{h}" if layout in _VERTICAL_LAYOUTS else ""
+        steps.append(f"subtitles={srt_name}{extra}:force_style='{style}'")
+    if layout == "vertical_blur":
+        return head + ("," + ",".join(steps) if steps else "") + "[v]"
+    return head + (",".join(steps) or "null") + "[v]"
 
 
 def _run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -181,17 +231,22 @@ def render_clip(source: Path, spec: ClipSpec, out_path: Path, srt_path: Path | N
     cmd = [
         config.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
         "-ss", f"{spec.start_s:.3f}", "-i", str(src_abs), "-t", f"{spec.duration_s:.3f}",
-        "-map", "0:v:0", "-map", "0:a:0?",
     ]
     cwd: str | None = None
+    srt_name: str | None = None
+    layout = config.OUTPUT_LAYOUT
+    style = config.SUBTITLE_STYLE if layout == "horizontal" else config.SUBTITLE_STYLE_VERTICAL
     if srt_abs is not None:
         srt_name = srt_abs.name
         if any(c in _UNSAFE_SRT_CHARS for c in srt_name) or not srt_name.isascii():
             tmp_srt = srt_abs.parent / f"_burn_{uuid.uuid4().hex[:8]}.srt"
             shutil.copyfile(srt_abs, tmp_srt)
             srt_name = tmp_srt.name
-        cmd += ["-vf", f"subtitles={srt_name}:force_style='{config.SUBTITLE_STYLE}'"]
         cwd = str(srt_abs.parent)
+    graph = build_video_filter(
+        layout, srt_name, size=tuple(config.VERTICAL_SIZE), fps=config.OUTPUT_FPS, style=style,
+    )
+    cmd += ["-filter_complex", graph, "-map", "[v]", "-map", "0:a:0?"]
     cmd += [
         "-c:v", "libx264", "-crf", str(config.VIDEO_CRF), "-preset", config.VIDEO_PRESET,
         "-c:a", "aac", "-b:a", config.AUDIO_BITRATE, "-movflags", "+faststart", str(out_abs),

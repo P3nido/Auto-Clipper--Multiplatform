@@ -132,3 +132,51 @@ def test_ffmpeg_missing(monkeypatch, tmp_path, sample):
     with pytest.raises(ClipperError):
         clipper.probe_duration(sample)
 
+
+
+def _probe_video(path: Path) -> dict[str, str]:
+    out = subprocess.run(
+        [config.FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,r_frame_rate", "-of", "default=nw=1", str(path)],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    values = dict(line.split("=", 1) for line in out)
+    return {"width": values["width"], "height": values["height"], "fps": values["r_frame_rate"]}
+
+
+@pytest.fixture(scope="module")
+def sample_hd(tmp_path_factory) -> Path:
+    out = tmp_path_factory.mktemp("hd") / "hd.mp4"
+    subprocess.run(
+        [config.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60",
+         "-f", "lavfi", "-i", "sine=frequency=440", "-t", "3",
+         "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(out)],
+        check=True,
+    )
+    return out
+
+
+@pytest.mark.parametrize("layout,expected", [
+    ("vertical_blur", ("1080", "1920")),
+    ("vertical_crop", ("1080", "1920")),
+    ("horizontal", ("1920", "1080")),
+])
+@pytest.mark.parametrize("with_srt", [False, True])
+def test_render_clip_layouts(sample_hd, tmp_path, monkeypatch, layout, expected, with_srt):
+    monkeypatch.setattr(config, "OUTPUT_LAYOUT", layout)
+    monkeypatch.setattr(config, "OUTPUT_FPS", 30)
+    srt = _srt(tmp_path / "s.srt") if with_srt else None
+    out = clipper.render_clip(sample_hd, ClipSpec(0, 0.5, 2.0, 10), tmp_path / "o.mp4", srt)
+    v = _probe_video(out)
+    assert (v["width"], v["height"]) == expected
+    assert v["fps"] == "30/1"
+    assert clipper.probe_duration(out) == pytest.approx(2.0, abs=0.2)
+    assert _probe_audio(out)["sample_rate"]  # trilha de áudio presente
+
+
+def test_render_clip_keeps_fps_when_none(sample_hd, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "OUTPUT_LAYOUT", "horizontal")
+    monkeypatch.setattr(config, "OUTPUT_FPS", None)
+    out = clipper.render_clip(sample_hd, ClipSpec(0, 0.5, 1.5, 10), tmp_path / "o.mp4")
+    assert _probe_video(out)["fps"] == "60/1"

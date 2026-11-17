@@ -85,7 +85,7 @@ Dependências fluem num sentido só: `main → (recorder, chat_listener, hype_de
 | `recorder.py` | `is_live(url)`, `Recorder`, `remux_to_mp4()`, `RecorderError` | subprocess, disco |
 | `chat_listener.py` | `ChatMessage`, `ChatSource` (+ `TwitchIRCSource`, `KickHistorySource`, `YouTubeInnerTubeSource`), `detect_platform()`, `channel_from_url()`, `make_chat_source()`, `ChatListener` | rede, disco |
 | `hype_detector.py` | `Spike`, `bucketize()`, `detect_spike_buckets()`, `find_spikes()` | só `find_spikes` lê disco |
-| `clipper.py` | `ClipSpec`, `plan_clips()`, `probe_duration()`, `extract_audio()`, `render_clip()`, `cut_clip()`, `ClipperError` | subprocess |
+| `clipper.py` | `ClipSpec`, `plan_clips()`, `build_video_filter()`, `probe_duration()`, `extract_audio()`, `render_clip()`, `cut_clip()`, `ClipperError` | subprocess |
 | `transcriber.py` | `load_model()`, `transcribe_to_srt()`, `format_srt()`, `TranscriberError` | modelo |
 | `main.py` | `main()`, `monitor_loop()`, `run_session()`, `postprocess()` | orquestra |
 
@@ -147,6 +147,13 @@ Cada clipe tem **um único encode de vídeo** (otimização medida em ARCHITECTU
 
 `cut_clip` continua existindo como atalho para `render_clip(..., srt_path=None)`.
 
+**Formato de saída (ADR-006):** o `render_clip` monta o `-filter_complex` com `build_video_filter(layout, srt_name, ...)`, uma função pura. A ordem é layout → fps → legenda: a legenda vem por último para ser desenhada na tela final.
+- `vertical_blur`: o fundo é uma cópia reduzida e desfocada (barata), ampliada até 1080×1920. Por cima, o vídeo vai na largura total, centralizado.
+- `vertical_crop`: recorta a faixa central 9:16 e escala para 1080×1920.
+- `horizontal`: mantém o 16:9.
+
+Nos layouts verticais, a legenda usa `SUBTITLE_STYLE_VERTICAL`.
+
 ## 9. Tratamento de erros
 
 | Falha | Comportamento |
@@ -163,7 +170,7 @@ Cada clipe tem **um único encode de vídeo** (otimização medida em ARCHITECTU
 1. **Endpoints internos (Kick e YouTube)** não são documentados e podem mudar sem aviso. Isso já aconteceu duas vezes: o `chat-downloader` quebrou e a Kick desativou o Pusher (ver ADR-002). *Mitigação:* adaptadores pequenos e isolados, erro claro no log e a gravação independente do chat.
 2. **Kick + Cloudflare:** tanto a gravação (Streamlink precisa de Chrome/Chromium) quanto o chat (`curl_cffi` imitando o Chrome) dependem de passar pelo desafio.
 3. **Disco:** medido na fase 2 (Twitch 1080p60 em `best`): cerca de 0,83 MB/s, ou seja, **~3 GB por hora** e ~12 GB numa live de 4 h. Para reduzir, use `STREAM_QUALITY = "720p"` ou `DELETE_RAW_AFTER_PROCESS`.
-4. **CPU:** com faster-whisper e encode único (ADR-005), cada clipe de 30 s em 1080p60 leva **~40 s** (eram ~132 s). Com `MAX_CLIPS = 30`, são ~20 min de pós-processamento. O gargalo agora é o encode x264 em 1080p60, e a próxima alavanca é a saída em 720p ou vertical 9:16 (formato de redes sociais).
+4. **CPU:** com faster-whisper e encode único (ADR-005), cada clipe de 30 s leva **~40–50 s** (eram ~132 s), já na saída vertical 1080×1920 a 30 fps (ADR-006). Com `MAX_CLIPS = 30`, são ~20–25 min de pós-processamento. O gargalo é o encode x264. As próximas alavancas são `VERTICAL_SIZE = (720, 1280)` ou um preset mais rápido.
 
 ## 11. Roteiro de implementação
 

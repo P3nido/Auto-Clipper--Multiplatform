@@ -1,8 +1,8 @@
 # Auto-Clipper Multiplataforma
 
-Monitora um canal da **Twitch**, **YouTube** ou **Kick** só pela URL, grava a live automaticamente, encontra os momentos de maior engajamento no chat, recorta clipes de 30 s e queima legendas geradas localmente pelo Whisper. É **100% gratuito e local**: não precisa de conta, token nem chave de API.
+Monitora um canal da **Twitch**, **YouTube** ou **Kick** só pela URL, grava a live automaticamente, encontra os momentos de maior engajamento no chat, recorta clipes de 30 s **na vertical (9:16), prontos para Reels, Shorts e TikTok**, e queima legendas geradas localmente pelo Whisper. É **100% gratuito e local**: não precisa de conta, token nem chave de API.
 
-> ✅ **Status:** v1 funcional, com as 5 etapas implementadas e validadas em lives reais (Twitch, Kick e YouTube) e 125 testes. Próximos passos de desempenho em [ARCHITECTURE.md §10](ARCHITECTURE.md#10-riscos-conhecidos).
+> ✅ **Status:** v1 funcional, com as 5 etapas implementadas e validadas em lives reais (Twitch, Kick e YouTube) e 152 testes. Próximos passos de desempenho em [ARCHITECTURE.md §10](ARCHITECTURE.md#10-riscos-conhecidos).
 
 ## Pipeline
 
@@ -51,10 +51,11 @@ Os resultados ficam em `sessions/<data>_<plataforma>_<canal>/final/`, com os nom
 
 ## Dicas
 
+- **Formato do clipe:** `OUTPUT_LAYOUT = "vertical_blur"` (padrão: vídeo inteiro sobre fundo desfocado, nada da tela é perdido), `"vertical_crop"` (tela cheia, corta as laterais e costuma cortar a webcam) ou `"horizontal"` (16:9 como a live).
 - **Live em outro idioma:** use `WHISPER_LANGUAGE = None` em `config.py` para o Whisper detectar o idioma. Forçar `"pt"` numa live em francês gera legenda vazia ou sem sentido.
 - **Poucos ou muitos clipes:** ajuste `SPIKE_MULTIPLIER` (menor = mais sensível) e `MIN_MESSAGES_PER_BUCKET` (piso para chats pequenos).
 - **Clipe começa tarde demais:** o chat reage depois do lance. Aumente `CLIP_PRE_S` ou `CHAT_DELAY_OFFSET_S`.
-- **Tempo de processamento:** em CPU, cada clipe de 30 s em 1080p leva ~40 s (faster-whisper `small` + 1 encode). O gargalo é o encode do vídeo em 1080p, e `STREAM_QUALITY = "720p"` acelera bastante.
+- **Tempo de processamento:** em CPU, cada clipe de 30 s leva ~40–50 s (faster-whisper `small` + 1 encode em 1080×1920 a 30 fps). O gargalo é o encode do vídeo: `VERTICAL_SIZE = (720, 1280)` ou `VIDEO_PRESET = "superfast"` aceleram bastante.
 - **Disco:** ~3 GB por hora em `best`. Use `STREAM_QUALITY = "720p"` ou `DELETE_RAW_AFTER_PROCESS = True`.
 - **FFmpeg recém-instalado:** se o terminal ainda não enxerga o `ffmpeg`, o programa encontra sozinho o atalho do winget.
 

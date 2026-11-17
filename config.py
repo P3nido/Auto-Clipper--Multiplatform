@@ -50,6 +50,13 @@ CLIP_POST_S = 15                # segundos depois do pico
 MAX_CLIPS = 30                  # limite por live (mantém os picos mais fortes)
 FFMPEG_BIN = "ffmpeg"           # ou caminho completo, ex.: r"C:\ffmpeg\bin\ffmpeg.exe"
 FFPROBE_BIN = "ffprobe"
+# Formato do clipe final (ADR-006):
+#   "vertical_blur": 9:16 com o vídeo inteiro sobre fundo desfocado (padrão de clipes de stream)
+#   "vertical_crop": 9:16 recortando o centro (tela cheia, perde as laterais)
+#   "horizontal":    16:9 como a live
+OUTPUT_LAYOUT = "vertical_blur"
+VERTICAL_SIZE = (1080, 1920)    # largura x altura dos layouts verticais
+OUTPUT_FPS: int | None = 30     # None = mantém o fps da live (60 fps dobra o tempo de encode)
 VIDEO_CRF = 18                  # qualidade do re-encode (menor = melhor/maior)
 VIDEO_PRESET = "veryfast"       # velocidade do x264: ultrafast ... veryslow (mais lento = menor)
 AUDIO_BITRATE = "160k"          # áudio AAC dos clipes
@@ -63,6 +70,15 @@ SUBTITLE_STYLE = (
     "FontName=Arial,FontSize=16,Bold=1,PrimaryColour=&H00FFFFFF,"
     "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,"
     "Alignment=2,MarginV=40"
+)
+# Estilo nos layouts verticais (1080x1920, calibrado com frame real). Os tamanhos seguem a escala do
+# libass: FontSize 10 ~ 67 px de altura de linha em 1920 (y*6,67), mas MarginL/R escalam em x (1080/384 = 2,8):
+# 21 -> ~60 px laterais. Alignment=2 + MarginV=60 deixa o texto em y~1310-1520, na faixa desfocada
+# logo abaixo do vídeo 16:9 (y 656-1264); no vertical_crop cai no terço inferior.
+SUBTITLE_STYLE_VERTICAL = (
+    "FontName=Arial,FontSize=10,Bold=1,PrimaryColour=&H00FFFFFF,"
+    "OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=0,"
+    "Alignment=2,MarginV=60,MarginL=21,MarginR=21"
 )
 
 # --- Saída --------------------------------------------------------------
