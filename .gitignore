@@ -26,3 +26,4 @@ build/
 dist/
 dist_next/
 dist_new/
+dist_*/
