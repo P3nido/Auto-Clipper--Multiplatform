@@ -111,6 +111,16 @@ Para quem não quer mexer em terminal: cole o link da live e deixe rodar.
 - `python gui.py --demo` mostra a interface com lives simuladas, sem gravar nada.
 - Sem FFmpeg instalado, a tela avisa e mostra o comando `winget install Gyan.FFmpeg`.
 
+## Enviar clipes ao Google Drive
+
+O app não pede login nem chave: ele só copia os clipes para a pasta do **Google Drive para desktop**, e o próprio Drive envia para a nuvem em segundo plano.
+
+1. Instale o Google Drive para desktop (google.com/drive/download) e entre na sua conta.
+2. No cartão da live, clique em **Enviar ao Drive**, marque os clipes e confirme. Eles vão para `Meu Drive\Auto-Clipper\<pasta da live>\`. Os que já foram enviados aparecem desmarcados.
+3. Para usar outra pasta (OneDrive, Dropbox, HD externo), vá em **Ajustes > Pasta do Google Drive** e clique em **Escolher…**. **Detectar** volta ao automático.
+
+Só os clipes finais são enviados; a gravação bruta, o áudio e as legendas ficam no computador.
+
 ## Executável (Windows, sem instalar nada)
 
 Gere a pasta pronta para usar em qualquer PC Windows (ADR-009):

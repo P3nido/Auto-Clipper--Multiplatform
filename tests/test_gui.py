@@ -3,6 +3,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -22,9 +23,11 @@ def app():
 
 @pytest.fixture(autouse=True)
 def restore_config():
-    saved = (config.OUTPUT_LAYOUT, config.WHISPER_LANGUAGE, config.SPIKE_MULTIPLIER, config.SESSIONS_DIR)
+    saved = (config.OUTPUT_LAYOUT, config.WHISPER_LANGUAGE, config.SPIKE_MULTIPLIER, config.SESSIONS_DIR,
+             config.EXPORT_DIR)
     yield
-    (config.OUTPUT_LAYOUT, config.WHISPER_LANGUAGE, config.SPIKE_MULTIPLIER, config.SESSIONS_DIR) = saved
+    (config.OUTPUT_LAYOUT, config.WHISPER_LANGUAGE, config.SPIKE_MULTIPLIER, config.SESSIONS_DIR,
+     config.EXPORT_DIR) = saved
 
 
 @pytest.fixture
@@ -206,7 +209,8 @@ def test_settings_roundtrip_and_apply(tmp_path):
     path = tmp_path / "settings.json"
     assert gui.load_settings(path) == gui.default_settings()
     values = {"output_layout": "horizontal", "whisper_language": None,
-              "spike_multiplier": 2.2, "sessions_dir": str(tmp_path / "saida")}
+              "spike_multiplier": 2.2, "sessions_dir": str(tmp_path / "saida"),
+              "export_dir": str(tmp_path / "drive")}
     gui.save_settings(values, path)
     assert json.loads(path.read_text(encoding="utf-8"))["output_layout"] == "horizontal"
     loaded = gui.load_settings(path)
@@ -216,6 +220,11 @@ def test_settings_roundtrip_and_apply(tmp_path):
     assert config.WHISPER_LANGUAGE is None
     assert config.SPIKE_MULTIPLIER == 2.2
     assert config.SESSIONS_DIR == str(tmp_path / "saida")
+    assert config.EXPORT_DIR == str(tmp_path / "drive")
+
+
+def test_export_dir_default_is_auto():
+    assert gui.default_settings()["export_dir"] == "auto"
 
 
 def test_corrupt_settings_fall_back(tmp_path):
@@ -266,3 +275,129 @@ def test_close_with_active_lives_asks_and_shuts_down(window, monkeypatch):
     window.closeEvent(event)
     assert event.isAccepted()
     assert called == [True]
+
+
+# ───────────────────────────── envio ao Drive (ADR-011) ─────────────────────────
+import time
+
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
+
+import exporter
+
+
+def _make_clips(folder: Path, n: int = 3) -> list[Path]:
+    folder.mkdir(parents=True, exist_ok=True)
+    clips = []
+    for i in range(1, n + 1):
+        clip = folder / f"clip_{i:02d}.mp4"
+        clip.write_bytes(b"x" * (1000 * i))
+        clips.append(clip)
+    return clips
+
+
+def _wait_until(predicate, timeout_s: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        QTest.qWait(20)
+        if predicate():
+            return True
+    return predicate()
+
+
+def test_settings_dialog_export_dir(app, tmp_path, monkeypatch):
+    monkeypatch.setattr(exporter, "detect_drive_folder", lambda: None)
+    dialog = gui.SettingsDialog(gui.default_settings())
+    assert dialog.values()["export_dir"] == "auto"
+    assert "não encontrado" in dialog.export_label.text()
+    monkeypatch.setattr(exporter, "detect_drive_folder", lambda: tmp_path / "Meu Drive")
+    dialog._detect_export()
+    assert dialog.export_label.text().startswith("Detectado:")
+    dialog.export_edit.setText(str(tmp_path / "x"))
+    assert dialog.export_label.text().startswith("Os clipes vão para:")
+    assert dialog.values()["export_dir"] == str(tmp_path / "x")
+    dialog._detect_export()
+    assert dialog.values()["export_dir"] == "auto"
+
+
+def test_job_card_export_button(app):
+    status = gui.JobStatus(job_id="j1", url="https://www.twitch.tv/gaules", platform="twitch",
+                           channel="gaules", state=JobState.WAITING, message="")
+    card = gui.JobCard(status)
+    assert not card.export_button.isVisibleTo(card)          # aguardando a live
+    card.update_status(dataclasses.replace(status, state=JobState.RECORDING))
+    assert card.export_button.isVisibleTo(card)
+    assert not card.export_button.isEnabled()
+    assert card.export_button.toolTip()
+    card.update_status(dataclasses.replace(status, state=JobState.RECORDING, final_clips=(Path("a.mp4"),)))
+    assert card.export_button.isEnabled()
+    got = []
+    card.export_requested.connect(got.append)
+    card.export_button.click()
+    assert got == ["j1"]
+
+
+def test_export_dialog_list_and_selection(app, tmp_path):
+    clips = _make_clips(tmp_path / "sessao" / "final")
+    dest = tmp_path / "drive" / "sessao"
+    dest.mkdir(parents=True)
+    (dest / clips[0].name).write_bytes(clips[0].read_bytes())
+    dialog = gui.ExportDialog(clips, dest, "gaules")
+    assert dialog.list.count() == 3
+    first = dialog.list.item(0)
+    assert first.checkState() == Qt.CheckState.Unchecked
+    assert "já está no Drive" in first.text()
+    assert dialog.list.item(1).checkState() == Qt.CheckState.Checked
+    assert "já está" not in dialog.list.item(1).text()
+    assert dialog.count_label.text().startswith("2 selecionados")
+    assert dialog.send_button.text() == "Enviar 2 clipes"
+    dialog.select_none_button.click()
+    assert dialog.count_label.text().startswith("0 selecionados")
+    assert not dialog.send_button.isEnabled()
+    dialog.select_all_button.click()
+    assert dialog.count_label.text().startswith("3 selecionados")
+    assert dialog.send_button.isEnabled()
+
+
+def test_export_dialog_full_send(app, tmp_path):
+    clips = _make_clips(tmp_path / "sessao" / "final")
+    dest = tmp_path / "drive" / "sessao"
+    dialog = gui.ExportDialog(clips, dest, "gaules")
+    dialog.show()
+    dialog.send_button.click()
+    assert dialog._busy
+    assert _wait_until(lambda: not dialog._busy)
+    dialog.wait_finished()
+    for clip in clips:
+        assert (dest / clip.name).read_bytes() == clip.read_bytes()
+    assert not list(dest.glob("*.part"))
+    assert "3 clipes copiados para o Drive" in dialog.status_label.text()
+    assert dialog.open_folder_button.isVisibleTo(dialog)
+    assert all(dialog.list.item(i).checkState() == Qt.CheckState.Unchecked for i in range(3))
+    assert "já está no Drive" in dialog.list.item(0).text()
+    dialog.close()
+
+
+def test_export_dialog_error_is_friendly(app, tmp_path):
+    clips = _make_clips(tmp_path / "sessao" / "final", 1)
+    dialog = gui.ExportDialog(clips, tmp_path / "drive", "gaules")
+    clips[0].unlink()
+    dialog.list.item(0).setCheckState(Qt.CheckState.Checked)
+    dialog.start_export()
+    assert _wait_until(lambda: not dialog._busy)
+    assert "Não deu para copiar" in dialog.status_label.text()
+    dialog.close()
+
+
+def test_export_clips_without_destination_warns(window, tmp_path, monkeypatch):
+    monkeypatch.setattr(exporter, "detect_drive_folder", lambda: None)
+    window.url_edit.setText("https://www.twitch.tv/gaules")
+    window.add_live()
+    job_id = next(iter(window._cards))
+    asked = []
+    opened = []
+    monkeypatch.setattr(window, "confirm", lambda title, text: asked.append((title, text)) or True)
+    monkeypatch.setattr(window, "open_settings", lambda: opened.append(True))
+    window._export_clips(job_id)
+    assert asked and "Google Drive" in asked[0][1]
+    assert opened == [True]

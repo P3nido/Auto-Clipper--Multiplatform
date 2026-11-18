@@ -31,7 +31,7 @@ hiddenimports += collect_submodules("streamlink.webbrowser")
 hiddenimports += ["trio", "trio_websocket", "wsproto", "outcome", "sniffio", "exceptiongroup"]
 # Módulos do projeto importados dentro de funções.
 hiddenimports += ["config", "runtime", "main", "gui", "engine", "hardware", "transcriber",
-                  "clipper", "recorder", "chat_listener", "hype_detector", "session"]
+                  "clipper", "recorder", "chat_listener", "hype_detector", "session", "exporter"]
 
 # DLLs CUDA (cuBLAS/cuDNN) do venv -> _internal/nvidia/<pacote>/bin (runtime.nvidia_dll_dirs).
 import sysconfig

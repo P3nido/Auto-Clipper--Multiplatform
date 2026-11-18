@@ -32,17 +32,18 @@ from PySide6.QtCore import QObject, QEventLoop, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QProgressBar, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 import config
+import exporter
 import runtime
 from chat_listener import channel_from_url, detect_platform
 from engine import JobState, JobStatus
 
 __all__ = [
-    "FakeJobManager", "MainWindow", "JobCard", "SettingsDialog",
+    "FakeJobManager", "MainWindow", "JobCard", "SettingsDialog", "ExportDialog",
     "load_settings", "save_settings", "apply_settings", "main",
 ]
 
@@ -65,7 +66,7 @@ FONT_FALLBACKS = ("Bahnschrift", "Segoe UI", "Arial")
 
 RADIUS_PX = 4
 MIN_WINDOW_SIZE = (900, 680)
-CARD_BUTTON_WIDTH = 120
+CARD_BUTTON_WIDTH = 132
 STAT_BLOCK_WIDTH = 104
 PULSE_INTERVAL_MS = 700
 DISK_REFRESH_MS = 30_000
@@ -90,7 +91,8 @@ LAYOUT_CHOICES = (
 )
 LANGUAGE_CHOICES = (("Português", "pt"), ("Detectar automaticamente", None))
 SENSITIVITY_CHOICES = (("Baixa (só momentos enormes)", 3.0), ("Média", 2.2), ("Alta (recomendado)", 1.8), ("Máxima", 1.5))
-SETTINGS_KEYS = ("output_layout", "whisper_language", "spike_multiplier", "sessions_dir")
+SETTINGS_KEYS = ("output_layout", "whisper_language", "spike_multiplier", "sessions_dir",
+                 "export_dir")
 
 
 def default_settings() -> dict:
@@ -101,6 +103,7 @@ def default_settings() -> dict:
         "whisper_language": config.WHISPER_LANGUAGE,
         "spike_multiplier": float(config.SPIKE_MULTIPLIER),
         "sessions_dir": config.SESSIONS_DIR,
+        "export_dir": config.EXPORT_DIR,
     }
 
 STATE_TITLES = {
@@ -155,6 +158,7 @@ def apply_settings(settings: dict) -> None:
     config.WHISPER_LANGUAGE = settings["whisper_language"]
     config.SPIKE_MULTIPLIER = float(settings["spike_multiplier"])
     config.SESSIONS_DIR = settings["sessions_dir"]
+    config.EXPORT_DIR = settings["export_dir"]
 
 
 # ─────────────────────────────── utilidades ──────────────────────────────────
@@ -274,7 +278,19 @@ class FakeJobManager:
             self._on_update(status)
         return job_id
 
+    def _ensure_demo_clips(self, count: int = 12) -> None:
+        """Cria clipes de mentira (arquivos pequenos) para a janela de envio funcionar na demo."""
+        try:
+            self._clips_dir.mkdir(parents=True, exist_ok=True)
+            for i in range(1, count + 1):
+                path = self._clips_dir / f"clip_{i:02d}.mp4"
+                if not path.exists():
+                    path.write_bytes(b"auto-clipper demo" * 1024 * i)
+        except OSError:
+            logger.warning("Não consegui criar os clipes de demonstração em %s", self._clips_dir)
+
     def _seed(self) -> None:
+        self._ensure_demo_clips()
         self._create("https://www.twitch.tv/gaules", "twitch", "gaules", JobState.RECORDING,
                      "Gravando vídeo e chat", recorded_s=4350, recorded_bytes=3_600_000_000,
                      chat_messages=12480, spikes=7, clips_done=2, clips_total=3,
@@ -326,6 +342,13 @@ class HardwareBridge(QObject):
     detected = Signal(str)
 
 
+class ExportBridge(QObject):
+    """Leva o progresso da thread de cópia para o thread da UI."""
+    progress = Signal(int, int)
+    finished = Signal(object)
+    failed = Signal(str)
+
+
 class StatBlock(QWidget):
     """Número grande (fonte condensada) com legenda pequena embaixo."""
 
@@ -351,6 +374,7 @@ class JobCard(QFrame):
 
     stop_requested = Signal(str)
     open_requested = Signal(str)
+    export_requested = Signal(str)
     remove_requested = Signal(str)
 
     def __init__(self, status: JobStatus) -> None:
@@ -431,9 +455,10 @@ class JobCard(QFrame):
         buttons.setSpacing(8)
         self.stop_button = QPushButton("Parar")
         self.open_button = QPushButton("Abrir clipes")
+        self.export_button = QPushButton("Enviar ao Drive")
         self.remove_button = QPushButton("Remover")
         self.remove_button.setObjectName("ghost")
-        for button in (self.stop_button, self.open_button, self.remove_button):
+        for button in (self.stop_button, self.open_button, self.export_button, self.remove_button):
             button.setFixedWidth(CARD_BUTTON_WIDTH)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             buttons.addWidget(button)
@@ -441,6 +466,7 @@ class JobCard(QFrame):
         root.addLayout(buttons)
         self.stop_button.clicked.connect(lambda: self.stop_requested.emit(self.job_id))
         self.open_button.clicked.connect(lambda: self.open_requested.emit(self.job_id))
+        self.export_button.clicked.connect(lambda: self.export_requested.emit(self.job_id))
         self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self.job_id))
 
     # --- estado ---
@@ -492,6 +518,9 @@ class JobCard(QFrame):
         has_clips = bool(status.final_clips)
         self.open_button.setEnabled(has_clips)
         self.open_button.setToolTip("" if has_clips else "Os clipes aparecem aqui quando ficarem prontos.")
+        self.export_button.setVisible(state not in (JobState.WAITING, JobState.ERROR))
+        self.export_button.setEnabled(has_clips)
+        self.export_button.setToolTip("" if has_clips else "Os clipes aparecem aqui quando ficarem prontos.")
         self._set_property(self.open_button, "primary", "true" if state == JobState.DONE and has_clips else "false")
 
     @staticmethod
@@ -575,6 +604,27 @@ class SettingsDialog(QDialog):
         form.addRow("Idioma da legenda", self.language_combo)
         form.addRow("Sensibilidade dos picos", self.sensitivity_combo)
         form.addRow("Pasta de saída", dir_row)
+
+        current_export = str(settings.get("export_dir") or config.EXPORT_AUTO)
+        self.export_edit = QLineEdit("" if current_export == config.EXPORT_AUTO else current_export)
+        self.export_edit.setPlaceholderText("Automático")
+        export_browse = QPushButton("Escolher…")
+        export_browse.setObjectName("ghost")
+        export_browse.clicked.connect(self._browse_export)
+        export_detect = QPushButton("Detectar")
+        export_detect.setObjectName("ghost")
+        export_detect.clicked.connect(self._detect_export)
+        export_row = QHBoxLayout()
+        export_row.addWidget(self.export_edit, 1)
+        export_row.addWidget(export_browse)
+        export_row.addWidget(export_detect)
+        form.addRow("Pasta do Google Drive", export_row)
+        self.export_label = QLabel()
+        self.export_label.setObjectName("message")
+        self.export_label.setWordWrap(True)
+        form.addRow("", self.export_label)
+        self.export_edit.textChanged.connect(self._refresh_export_label)
+        self._refresh_export_label()
         hint = QLabel("Sensibilidade alta gera mais clipes, com momentos menos fortes.")
         hint.setObjectName("message")
         hint.setWordWrap(True)
@@ -607,13 +657,253 @@ class SettingsDialog(QDialog):
         if folder:
             self.dir_edit.setText(folder)
 
+    def _browse_export(self) -> None:
+        start = self.export_edit.text() or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "Pasta do Google Drive", start)
+        if folder:
+            self.export_edit.setText(folder)
+
+    def _detect_export(self) -> None:
+        self.export_edit.setText("")
+        self._refresh_export_label()
+
+    def _refresh_export_label(self) -> None:
+        text = self.export_edit.text().strip()
+        resolved = exporter.resolve_export_dir(text or config.EXPORT_AUTO)
+        if not text or text == config.EXPORT_AUTO:
+            if resolved is not None:
+                self.export_label.setText(f"Detectado: {resolved}")
+            else:
+                self.export_label.setText(
+                    "Google Drive para desktop não encontrado. Instale-o (google.com/drive/download) "
+                    "ou escolha outra pasta.")
+        else:
+            self.export_label.setText(f"Os clipes vão para: {resolved}")
+
     def values(self) -> dict:
         return {
             "output_layout": self.layout_combo.currentData(),
             "whisper_language": self.language_combo.currentData(),
             "spike_multiplier": self.sensitivity_combo.currentData(),
             "sessions_dir": self.dir_edit.text().strip() or default_settings()["sessions_dir"],
+            "export_dir": self.export_edit.text().strip() or config.EXPORT_AUTO,
         }
+
+
+class ExportDialog(QDialog):
+    """Escolha de clipes para copiar à pasta do Google Drive (ADR-011)."""
+
+    def __init__(self, clips: list[Path], dest_dir: Path, channel: str,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.clips = [Path(c) for c in clips]
+        self.dest_dir = Path(dest_dir)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._busy = False
+        self.setWindowTitle("Enviar ao Drive")
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 20)
+        layout.setSpacing(12)
+        title = QLabel(f"Enviar clipes de {channel}")
+        title.setObjectName("channel")
+        layout.addWidget(title)
+        self.dest_label = QLabel(f"Destino: {self.dest_dir}")
+        self.dest_label.setObjectName("message")
+        self.dest_label.setWordWrap(True)
+        layout.addWidget(self.dest_label)
+
+        self.list = QListWidget()
+        self.list.setMinimumHeight(220)
+        self.list.itemChanged.connect(lambda _: self._update_selection())
+        self.list.itemDoubleClicked.connect(self._open_item)
+        layout.addWidget(self.list, 1)
+
+        tools = QHBoxLayout()
+        self.select_all_button = QPushButton("Marcar todos")
+        self.select_none_button = QPushButton("Desmarcar todos")
+        for button in (self.select_all_button, self.select_none_button):
+            button.setObjectName("ghost")
+            tools.addWidget(button)
+        self.select_all_button.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+        self.select_none_button.clicked.connect(lambda: self._set_all(Qt.CheckState.Unchecked))
+        tools.addStretch(1)
+        self.count_label = QLabel()
+        self.count_label.setObjectName("message")
+        tools.addWidget(self.count_label)
+        layout.addLayout(tools)
+
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(4)
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
+        self.status_label = QLabel()
+        self.status_label.setObjectName("message")
+        self.status_label.setWordWrap(True)
+        self.status_label.setVisible(False)
+        layout.addWidget(self.status_label)
+
+        buttons = QHBoxLayout()
+        self.open_folder_button = QPushButton("Abrir pasta")
+        self.open_folder_button.setObjectName("ghost")
+        self.open_folder_button.setVisible(False)
+        self.open_folder_button.clicked.connect(lambda: open_folder(self.dest_dir))
+        self.send_button = QPushButton("Enviar")
+        self.send_button.setObjectName("primary")
+        self.send_button.clicked.connect(self.start_export)
+        self.close_button = QPushButton("Fechar")
+        self.close_button.setObjectName("ghost")
+        self.close_button.clicked.connect(self.close)
+        buttons.addWidget(self.open_folder_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.close_button)
+        buttons.addWidget(self.send_button)
+        layout.addLayout(buttons)
+
+        self._bridge = ExportBridge()
+        self._bridge.progress.connect(self._on_progress)
+        self._bridge.finished.connect(self._on_finished)
+        self._bridge.failed.connect(self._on_failed)
+
+        self._fill_list()
+
+    # --- lista ---
+    @staticmethod
+    def _size_of(clip: Path) -> int:
+        try:
+            return clip.stat().st_size
+        except OSError:
+            return 0
+
+    def _fill_list(self) -> None:
+        self.list.blockSignals(True)
+        self.list.clear()
+        for clip in self.clips:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, str(clip))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            self.list.addItem(item)
+            self._refresh_item(item)
+        self.list.blockSignals(False)
+        self._update_selection()
+
+    def _refresh_item(self, item: QListWidgetItem) -> None:
+        clip = Path(item.data(Qt.ItemDataRole.UserRole))
+        text = f"{clip.name}  ·  {format_size(self._size_of(clip))}"
+        exported = exporter.is_already_exported(clip, self.dest_dir)
+        if exported:
+            text += "  ·  já está no Drive"
+        item.setText(text)
+        item.setCheckState(Qt.CheckState.Unchecked if exported else Qt.CheckState.Checked)
+
+    def _items(self) -> list[QListWidgetItem]:
+        return [self.list.item(i) for i in range(self.list.count())]
+
+    def selected_clips(self) -> list[Path]:
+        return [Path(it.data(Qt.ItemDataRole.UserRole)) for it in self._items()
+                if it.checkState() == Qt.CheckState.Checked]
+
+    def _set_all(self, state: Qt.CheckState) -> None:
+        self.list.blockSignals(True)
+        for item in self._items():
+            item.setCheckState(state)
+        self.list.blockSignals(False)
+        self._update_selection()
+
+    def _update_selection(self) -> None:
+        selected = self.selected_clips()
+        total = sum(self._size_of(c) for c in selected)
+        self.count_label.setText(f"{len(selected)} selecionados ({format_size(total)})")
+        n = len(selected)
+        self.send_button.setText("Nenhum selecionado" if n == 0
+                                 else "Enviar 1 clipe" if n == 1 else f"Enviar {n} clipes")
+        self.send_button.setEnabled(n > 0 and not self._busy)
+
+    def _open_item(self, item: QListWidgetItem) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(item.data(Qt.ItemDataRole.UserRole))))
+
+    # --- envio ---
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        for widget in (self.list, self.select_all_button, self.select_none_button):
+            widget.setEnabled(not busy)
+        self.progress.setVisible(busy)
+        self._update_selection()
+
+    def start_export(self) -> None:
+        clips = self.selected_clips()
+        if not clips or self._busy:
+            return
+        self._stop.clear()
+        self.status_label.setVisible(False)
+        self.open_folder_button.setVisible(False)
+        self.progress.setRange(0, len(clips))
+        self.progress.setValue(0)
+        self._set_busy(True)
+        bridge, stop, dest = self._bridge, self._stop, self.dest_dir
+
+        def emit(signal, *args) -> None:
+            try:
+                signal.emit(*args)
+            except RuntimeError:       # janela já destruída
+                logger.debug("Janela de envio fechada antes do fim da cópia")
+
+        def work() -> None:
+            try:
+                result = exporter.export_clips(
+                    clips, dest, stop_event=stop,
+                    on_progress=lambda done, total: emit(bridge.progress, done, total))
+            except (exporter.ExportError, OSError) as exc:
+                logger.exception("Falha ao enviar clipes para %s", dest)
+                emit(bridge.failed, str(exc))
+            except Exception as exc:  # noqa: BLE001 - a thread nunca morre calada
+                logger.exception("Erro inesperado ao enviar clipes para %s", dest)
+                emit(bridge.failed, str(exc))
+            else:
+                emit(bridge.finished, result)
+
+        self._thread = threading.Thread(target=work, name="gui-export", daemon=True)
+        self._thread.start()
+
+    def _on_progress(self, done: int, total: int) -> None:
+        self.progress.setRange(0, total)
+        self.progress.setValue(done)
+
+    def _on_finished(self, result) -> None:
+        self._set_busy(False)
+        self._fill_list()
+        copied, skipped = len(result.copied), len(result.skipped)
+        text = (f"{copied} clipe copiado para o Drive." if copied == 1
+                else f"{copied} clipes copiados para o Drive.")
+        text += " O Google Drive envia para a nuvem em segundo plano."
+        if skipped:
+            text += f" {skipped} já estava lá." if skipped == 1 else f" {skipped} já estavam lá."
+        self.status_label.setText(text)
+        self.status_label.setVisible(True)
+        self.open_folder_button.setVisible(True)
+
+    def _on_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._fill_list()
+        self.status_label.setText(
+            f"Não deu para copiar os clipes: {message}. Confira se a pasta de destino está acessível "
+            "e se há espaço livre.")
+        self.status_label.setVisible(True)
+
+    def wait_finished(self, timeout_s: float = 5.0) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout_s)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (nome do Qt)
+        self._stop.set()
+        super().closeEvent(event)
+
+    def reject(self) -> None:
+        self._stop.set()
+        super().reject()
 
 
 # ───────────────────────────────── janela principal ──────────────────────────
@@ -797,6 +1087,7 @@ class MainWindow(QWidget):
             card = JobCard(status)
             card.stop_requested.connect(self._stop_job)
             card.open_requested.connect(self._open_clips)
+            card.export_requested.connect(self._export_clips)
             card.remove_requested.connect(self._remove_job)
             self._cards[status.job_id] = card
             self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
@@ -815,6 +1106,21 @@ class MainWindow(QWidget):
         folder = self._cards[job_id].clips_folder()
         if folder is not None:
             open_folder(folder)
+
+    def _export_clips(self, job_id: str) -> None:
+        card = self._cards[job_id]
+        base = exporter.resolve_export_dir(self._settings.get("export_dir"))
+        if base is None:
+            if self.confirm("Google Drive não encontrado",
+                            "O Google Drive para desktop não foi encontrado neste computador. "
+                            "Instale-o (google.com/drive/download) ou escolha outra pasta em Ajustes.\n\n"
+                            "Abrir os Ajustes agora?"):
+                self.open_settings()
+            return
+        clips = list(card.status.final_clips)
+        dest = exporter.destination_for(base, card.status.session_dir, clips)
+        self._export_dialog = ExportDialog(clips, dest, card.status.channel, self)
+        self._export_dialog.exec()
 
     def _remove_job(self, job_id: str) -> None:
         try:
@@ -924,6 +1230,10 @@ QToolTip {{ background: {SURFACE}; color: {FG}; border: 1px solid {BORDER}; }}
 
 QLineEdit {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: {RADIUS_PX}px;
             padding: 0 14px; min-height: 28px; selection-background-color: {ACCENT}; selection-color: {BG}; }}
+QListWidget {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: {RADIUS_PX}px; padding: 4px; }}
+QListWidget::item {{ padding: 6px 4px; }}
+QListWidget::item:hover {{ background: {SURFACE_HOVER}; }}
+QListWidget:disabled {{ color: {FG_FAINT}; }}
 QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
 #urlEdit {{ min-height: 40px; font-size: 14px; }}
 
@@ -936,6 +1246,7 @@ QPushButton#primary, QPushButton[primary="true"] {{ background: {ACCENT}; color:
               font-weight: 700; }}
 QPushButton#primary {{ padding: 0 24px; min-height: 40px; font-size: 14px; }}
 QPushButton#primary:hover, QPushButton[primary="true"]:hover {{ background: #d6ff3d; border-color: #d6ff3d; }}
+QPushButton#primary:disabled {{ background: transparent; color: {FG_FAINT}; border: 1px solid {BORDER}; }}
 QPushButton#ghost {{ border-color: transparent; color: {FG_DIM}; }}
 QPushButton#ghost:hover {{ color: {FG}; background: {SURFACE}; }}
 

@@ -104,6 +104,15 @@ LIVE_CLIPPING = True            # gera os clipes DURANTE a live (False = tudo s�
 LIVE_SCAN_INTERVAL_S = 30       # de quanto em quanto tempo procura picos novos no chat
 LIVE_SAFETY_MARGIN_S = 5        # folga: o fim da janela precisa estar gravado com esta sobra
 
+# --- Enviar ao Google Drive (ADR-011) -----------------------------------
+# O app copia os clipes escolhidos para a pasta do Google Drive para desktop,
+# que sobe para a nuvem sozinho. "auto" detecta "G:\Meu Drive" (ou "My Drive");
+# também aceita qualquer pasta, ex.: r"D:\OneDrive\Clipes".
+EXPORT_DIR = "auto"
+EXPORT_AUTO = "auto"
+EXPORT_SUBFOLDER = "Auto-Clipper"           # dentro do Drive: Meu Drive\Auto-Clipper\<live>\
+DRIVE_ROOT_NAMES = ("Meu Drive", "My Drive")
+
 # --- Saída --------------------------------------------------------------
 SESSIONS_DIR = "sessions"
 DELETE_RAW_AFTER_PROCESS = False   # apaga os .ts depois de gerar os clipes finais

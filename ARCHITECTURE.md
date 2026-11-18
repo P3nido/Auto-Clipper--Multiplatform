@@ -49,6 +49,7 @@ auto-clipper/
 ├── engine.py            # JobManager: N lives em paralelo + fila única de clipes (ADR-008)
 ├── hardware.py          # detecção de GPU: NVENC/Quick Sync/AMF/CPU e Whisper CUDA/CPU (ADR-007)
 ├── gui.py               # interface gráfica PySide6
+├── exporter.py          # copia clipes escolhidos para a pasta do Google Drive (ADR-011)
 ├── session.py           # Session/RecordingSegment: pastas, manifesto session.json, relógio
 ├── recorder.py          # Etapa 1 — is_live() e Recorder (Streamlink em subprocess)
 ├── chat_listener.py     # Etapa 2 — ChatMessage, porta ChatSource, adaptadores, ChatListener
@@ -93,7 +94,8 @@ Dependências fluem num sentido só: `main → (recorder, chat_listener, hype_de
 | `hardware.py` | `HardwareProfile`, `detect()`, `encoder_args()`, `decoder_args()`, `prepare_cuda_dlls()`, `diagnose()` (ADR-007) | subprocess (testes de encode) |
 | `engine.py` | `JobManager`, `JobStatus`, `JobState`, `record_session()` (kwargs `on_scan`, `on_session`), `process_session()` (ADR-008, ADR-010) | orquestra N lives + fila de clipes |
 | `main.py` | CLI fina sobre o `engine`: várias `--url`, `--once`, `--process`, `--max-duration`, `--diagnostico` | — |
-| `gui.py` | interface PySide6 sobre o `engine` (ADR-008) | UI |
+| `gui.py` | interface PySide6 sobre o `engine` (ADR-008); "Enviar ao Drive" chama o `exporter` | UI |
+| `exporter.py` | `ExportError`, `ExportResult`, `detect_drive_folder()`, `resolve_export_dir()`, `destination_for()`, `is_already_exported()`, `export_clips()` (ADR-011) | disco (cópia para a pasta do Drive) |
 | `runtime.py` | `is_frozen()`, `app_dir()`, `data_dir()`, `default_sessions_dir()`, `bundled_tool()`, `streamlink_command()`, `subprocess_flags()`, `nvidia_dll_dirs()` (ADR-009) | caminhos do pacote |
 | `launcher_gui.py` / `launcher_cli.py` | entradas do `Auto-Clipper.exe` e do `auto-clipper-cli.exe` (`--run-streamlink`) | — |
 
