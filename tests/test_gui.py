@@ -885,3 +885,92 @@ def test_close_shuts_down_upload_queue(yt_window, monkeypatch):
     yt_window.closeEvent(event)
     assert event.isAccepted() and queue.shutdown_calls == 1
     assert asked and "YouTube" in asked[0]
+
+
+# ───────────────────────── Abrir gravação (lives antigas) ─────────────────────────
+from PySide6.QtWidgets import QFileDialog
+
+
+def _recorded(tmp_path: Path, name="20261118-091500_twitch_alanzoka", clips=3, manifest=True) -> Path:
+    root = tmp_path / name
+    final = root / "final"
+    final.mkdir(parents=True)
+    for i in range(clips):
+        (final / f"clip_{i:02d}.mp4").write_bytes(b"x")
+    if manifest:
+        (root / "live_00.ts").write_bytes(b"x" * 10)
+        (root / "session.json").write_text(json.dumps({
+            "url": "https://www.twitch.tv/alanzoka", "platform": "twitch", "channel": "alanzoka",
+            "created_at": 1.0,
+            "segments": [{"index": 0, "path": "live_00.ts", "wall_start": 100.0, "wall_end": 160.0}],
+        }), encoding="utf-8")
+    return root
+
+
+def test_load_recorded_session_from_session_and_final_dir(tmp_path):
+    root = _recorded(tmp_path)
+    (root / "final" / "x.mp4.part").write_bytes(b"x")
+    status = gui.load_recorded_session(root)
+    assert status.job_id == "disk:" + str(root.resolve())
+    assert status.state is JobState.DONE and status.message == "Gravação aberta do disco"
+    assert (status.channel, status.platform, status.url) == ("alanzoka", "twitch", "https://www.twitch.tv/alanzoka")
+    assert [c.name for c in status.final_clips] == ["clip_00.mp4", "clip_01.mp4", "clip_02.mp4"]
+    assert status.clips_done == status.clips_total == status.spikes == 3
+    assert status.recorded_s == 60.0 and status.recorded_bytes == 10
+    assert status.session_dir == root.resolve()
+    assert gui.load_recorded_session(root / "final").job_id == status.job_id
+
+
+def test_load_recorded_session_falls_back_to_folder_name(tmp_path):
+    root = _recorded(tmp_path, name="20261118-091500_kick_foo_bar", manifest=False)
+    status = gui.load_recorded_session(root)
+    assert (status.platform, status.channel, status.url) == ("kick", "foo_bar", "")
+    assert status.recorded_s == 0 and status.recorded_bytes == 0
+
+
+def test_load_recorded_session_errors(tmp_path):
+    empty = _recorded(tmp_path, clips=0)
+    with pytest.raises(ValueError, match="ainda não tem clipes"):
+        gui.load_recorded_session(empty)
+    (empty / "final" / "a.mp4.part").write_bytes(b"x")
+    with pytest.raises(ValueError, match="ainda não tem clipes"):
+        gui.load_recorded_session(empty)
+    other = tmp_path / "qualquer"
+    other.mkdir()
+    with pytest.raises(ValueError, match="não parece ser de uma live"):
+        gui.load_recorded_session(other)
+
+
+def _pick(monkeypatch, folder):
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: str(folder))
+
+
+def test_open_recording_creates_card_once_and_reports_errors(yt_window, tmp_path, monkeypatch):
+    root = _recorded(tmp_path)
+    _pick(monkeypatch, root)
+    yt_window.open_recording()
+    assert list(yt_window._cards) == ["disk:" + str(root.resolve())]
+    card = yt_window._cards[next(iter(yt_window._cards))]
+    assert card.status.state is JobState.DONE and yt_window.active_count() == 0
+    yt_window.open_recording()
+    assert len(yt_window._cards) == 1
+    _pick(monkeypatch, tmp_path / "qualquer")
+    (tmp_path / "qualquer").mkdir()
+    yt_window.open_recording()
+    assert "não parece ser de uma live" in yt_window.error_label.text()
+    _pick(monkeypatch, "")
+    yt_window.open_recording()                                   # cancelar: nada muda
+    assert len(yt_window._cards) == 1
+
+
+def test_disk_card_never_auto_posts_and_remove_skips_manager(yt_window, tmp_path, monkeypatch):
+    _enable_auto(yt_window, True)
+    root = _recorded(tmp_path)
+    _pick(monkeypatch, root)
+    yt_window.open_recording()
+    assert yt_window._yt_queue is None
+    job_id = next(iter(yt_window._cards))
+    calls = []
+    monkeypatch.setattr(yt_window.manager, "remove", lambda j: calls.append(j))
+    yt_window._remove_job(job_id)
+    assert calls == [] and not yt_window._cards

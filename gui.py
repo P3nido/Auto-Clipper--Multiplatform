@@ -43,10 +43,11 @@ import runtime
 import uploader
 from chat_listener import channel_from_url, detect_platform
 from engine import JobState, JobStatus
+from session import Session
 
 __all__ = [
     "FakeJobManager", "MainWindow", "JobCard", "SettingsDialog", "ExportDialog",
-    "YouTubeDialog", "load_settings", "save_settings", "apply_settings", "main",
+    "YouTubeDialog", "load_recorded_session", "load_settings", "save_settings", "apply_settings", "main",
 ]
 
 logger = logging.getLogger(__name__)
@@ -1357,6 +1358,53 @@ class YouTubeDialog(QDialog):
 
 
 # ───────────────────────────────── janela principal ──────────────────────────
+DISK_JOB_PREFIX = "disk:"      # ids de cartões abertos do disco: o motor nunca os vê
+
+
+def load_recorded_session(path: Path) -> JobStatus:
+    """Monta um JobStatus (DONE) de uma live já gravada, só lendo o disco (sem reprocessar).
+
+    Aceita a pasta da sessão (com session.json) ou a pasta final/ dentro dela.
+    Levanta ValueError com mensagem pt-BR se a pasta não servir.
+    """
+    path = Path(path)
+    if (path / "session.json").is_file():
+        root = path
+    elif path.name.lower() == "final" and path.is_dir():
+        root = path.parent
+    elif (path / "final").is_dir():
+        root = path
+    else:
+        raise ValueError("Essa pasta não parece ser de uma live gravada pelo Auto-Clipper.")
+    root = root.resolve()
+    clips = tuple(sorted(p for p in (root / "final").glob("*.mp4") if p.is_file()))         if (root / "final").is_dir() else ()
+    if not clips:
+        raise ValueError("Essa gravação ainda não tem clipes prontos na pasta final.")
+
+    url, platform, channel = "", "", root.name
+    recorded_s, recorded_bytes = 0.0, 0
+    try:
+        session = Session.load(root)
+        url, platform, channel = session.url, session.platform, session.channel
+        for seg in session.segments:
+            if seg.wall_start is not None and seg.wall_end is not None:
+                recorded_s += max(0.0, seg.wall_end - seg.wall_start)
+            try:
+                recorded_bytes += seg.path.stat().st_size
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001 - manifesto ausente/antigo: cai no nome da pasta
+        parts = root.name.split("_", 2)
+        if len(parts) == 3 and parts[2]:
+            platform, channel = parts[1], parts[2]
+    return JobStatus(
+        job_id=DISK_JOB_PREFIX + str(root), url=url, platform=platform, channel=channel,
+        state=JobState.DONE, message="Gravação aberta do disco",
+        recorded_s=recorded_s, recorded_bytes=recorded_bytes, spikes=len(clips),
+        clips_done=len(clips), clips_total=len(clips), session_dir=root, final_clips=clips,
+        updated_at=time.time())
+
+
 class MainWindow(QWidget):
     def __init__(self, manager_factory: Callable[[Callable[[JobStatus], None]], object],
                  settings_path: Path = SETTINGS_PATH,
@@ -1417,6 +1465,11 @@ class MainWindow(QWidget):
         title.setObjectName("appTitle")
         top.addWidget(title)
         top.addStretch(1)
+        self.open_recording_button = QPushButton("Abrir gravação")
+        self.open_recording_button.setObjectName("ghost")
+        self.open_recording_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.open_recording_button.clicked.connect(self.open_recording)
+        top.addWidget(self.open_recording_button)
         self.settings_button = QPushButton("Ajustes")
         self.settings_button.setObjectName("ghost")
         self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1556,6 +1609,32 @@ class MainWindow(QWidget):
         box.setDefaultButton(QMessageBox.StandardButton.No)
         return box.exec() == QMessageBox.StandardButton.Yes
 
+    def _sessions_start_dir(self) -> Path:
+        base = Path(str(self._settings["sessions_dir"]))
+        if not base.is_absolute() and not base.exists():
+            base = Path(runtime.default_sessions_dir())
+        return base if base.exists() else Path.home()
+
+    def open_recording(self) -> None:
+        """Carrega uma live já gravada como cartão (só mostra o que existe em final/)."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Escolha a pasta da live gravada", str(self._sessions_start_dir()))
+        if not folder:
+            return
+        try:
+            status = load_recorded_session(Path(folder))
+        except ValueError as exc:
+            self.set_error(str(exc))
+            return
+        self.set_error("")
+        for card in self._cards.values():
+            other = card.status.session_dir
+            if other is not None and Path(other).resolve() == status.session_dir:
+                self.scroll.ensureWidgetVisible(card)
+                return
+        self._on_status(status)
+        self.scroll.ensureWidgetVisible(self._cards[status.job_id])
+
     def _on_status(self, status: JobStatus) -> None:
         card = self._cards.get(status.job_id)
         if card is None:
@@ -1571,7 +1650,10 @@ class MainWindow(QWidget):
             card.update_status(status)
         for clip in status.final_clips:
             self._clip_jobs[clip] = status.job_id
-        self._auto_post(status)
+        if status.job_id.startswith(DISK_JOB_PREFIX):
+            self._seen_clips.update(status.final_clips)    # clipes antigos: nunca postam sozinhos
+        else:
+            self._auto_post(status)
         self._refresh_visibility()
         self.refresh_footer()
 
@@ -1698,11 +1780,12 @@ class MainWindow(QWidget):
         logger.warning("Aviso do YouTube (%s): %s", kind, message)
 
     def _remove_job(self, job_id: str) -> None:
-        try:
-            self.manager.remove(job_id)
-        except ValueError as exc:      # live ainda ativa: o botão não deveria estar visível
-            logger.warning("Não foi possível remover a live %s: %s", job_id, exc)
-            return
+        if not job_id.startswith(DISK_JOB_PREFIX):     # cartão de disco não existe no motor
+            try:
+                self.manager.remove(job_id)
+            except ValueError as exc:      # live ainda ativa: o botão não deveria estar visível
+                logger.warning("Não foi possível remover a live %s: %s", job_id, exc)
+                return
         card = self._cards.pop(job_id, None)
         if card is not None:
             self.cards_layout.removeWidget(card)

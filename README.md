@@ -119,6 +119,8 @@ O app não pede login nem chave: ele só copia os clipes para a pasta do **Googl
 2. No cartão da live, clique em **Enviar ▾ > Google Drive**, marque os clipes e confirme. Eles vão para `Meu Drive\Auto-Clipper\<pasta da live>\`. Os que já foram enviados aparecem desmarcados.
 3. Para usar outra pasta (OneDrive, Dropbox, HD externo), vá em **Ajustes > Pasta do Google Drive** e clique em **Escolher…**. **Detectar** volta ao automático.
 
+Para enviar clipes de lives antigas: **Abrir gravação** → escolha a pasta da live em `Vídeos\Auto-Clipper`.
+
 Só os clipes finais são enviados; a gravação bruta, o áudio e as legendas ficam no computador.
 
 ## Postar no YouTube
