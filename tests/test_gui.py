@@ -5,6 +5,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import dataclasses
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -24,10 +25,10 @@ def app():
 @pytest.fixture(autouse=True)
 def restore_config():
     saved = (config.OUTPUT_LAYOUT, config.WHISPER_LANGUAGE, config.SPIKE_MULTIPLIER, config.SESSIONS_DIR,
-             config.EXPORT_DIR)
+             config.EXPORT_DIR, config.YOUTUBE_PRIVACY, config.YOUTUBE_AUTO_UPLOAD)
     yield
     (config.OUTPUT_LAYOUT, config.WHISPER_LANGUAGE, config.SPIKE_MULTIPLIER, config.SESSIONS_DIR,
-     config.EXPORT_DIR) = saved
+     config.EXPORT_DIR, config.YOUTUBE_PRIVACY, config.YOUTUBE_AUTO_UPLOAD) = saved
 
 
 @pytest.fixture
@@ -210,7 +211,8 @@ def test_settings_roundtrip_and_apply(tmp_path):
     assert gui.load_settings(path) == gui.default_settings()
     values = {"output_layout": "horizontal", "whisper_language": None,
               "spike_multiplier": 2.2, "sessions_dir": str(tmp_path / "saida"),
-              "export_dir": str(tmp_path / "drive")}
+              "export_dir": str(tmp_path / "drive"),
+              "youtube_privacy": "unlisted", "youtube_auto_upload": True}
     gui.save_settings(values, path)
     assert json.loads(path.read_text(encoding="utf-8"))["output_layout"] == "horizontal"
     loaded = gui.load_settings(path)
@@ -221,6 +223,8 @@ def test_settings_roundtrip_and_apply(tmp_path):
     assert config.SPIKE_MULTIPLIER == 2.2
     assert config.SESSIONS_DIR == str(tmp_path / "saida")
     assert config.EXPORT_DIR == str(tmp_path / "drive")
+    assert config.YOUTUBE_PRIVACY == "unlisted"
+    assert config.YOUTUBE_AUTO_UPLOAD is True
 
 
 def test_export_dir_default_is_auto():
@@ -320,10 +324,15 @@ def test_settings_dialog_export_dir(app, tmp_path, monkeypatch):
     assert dialog.values()["export_dir"] == "auto"
 
 
-def test_job_card_export_button(app):
+def _card(state=JobState.WAITING, **extra):
     status = gui.JobStatus(job_id="j1", url="https://www.twitch.tv/gaules", platform="twitch",
                            channel="gaules", state=JobState.WAITING, message="")
-    card = gui.JobCard(status)
+    return status, gui.JobCard(dataclasses.replace(status, state=state, **extra))
+
+
+def test_job_card_send_menu(app):
+    status, card = _card()
+    assert card.export_button.text() == "Enviar ▾"
     assert not card.export_button.isVisibleTo(card)          # aguardando a live
     card.update_status(dataclasses.replace(status, state=JobState.RECORDING))
     assert card.export_button.isVisibleTo(card)
@@ -331,10 +340,23 @@ def test_job_card_export_button(app):
     assert card.export_button.toolTip()
     card.update_status(dataclasses.replace(status, state=JobState.RECORDING, final_clips=(Path("a.mp4"),)))
     assert card.export_button.isEnabled()
-    got = []
-    card.export_requested.connect(got.append)
-    card.export_button.click()
-    assert got == ["j1"]
+    assert [a.text() for a in card.export_button.menu().actions()] == ["Google Drive", "YouTube"]
+    drive, youtube = [], []
+    card.export_requested.connect(drive.append)
+    card.youtube_requested.connect(youtube.append)
+    card.drive_action.trigger()
+    assert drive == ["j1"] and youtube == []
+    card.youtube_action.trigger()
+    assert youtube == ["j1"]
+
+
+def test_job_card_youtube_text(app):
+    _status, card = _card(JobState.DONE)
+    assert not card.youtube_label.isVisibleTo(card)
+    card.set_youtube_text("YouTube: 3 postados")
+    assert card.youtube_label.isVisibleTo(card) and card.youtube_label.text() == "YouTube: 3 postados"
+    card.set_youtube_text("")
+    assert not card.youtube_label.isVisibleTo(card)
 
 
 def test_export_dialog_list_and_selection(app, tmp_path):
@@ -401,3 +423,465 @@ def test_export_clips_without_destination_warns(window, tmp_path, monkeypatch):
     window._export_clips(job_id)
     assert asked and "Google Drive" in asked[0][1]
     assert opened == [True]
+
+
+# ───────────────────────────── postar no YouTube (ADR-012) ──────────────────────
+import uploader
+
+
+class FakeYouTubeClient:
+    def __init__(self, *, configured=True, connected=True, connect_error: str = "") -> None:
+        self.configured = configured
+        self.connected = connected
+        self.connect_error = connect_error
+        self.installed: list[Path] = []
+        self.connect_calls = 0
+
+    def is_configured(self) -> bool:
+        return self.configured
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def install_client_secret(self, source: Path) -> None:
+        self.installed.append(Path(source))
+        self.configured = True
+
+    def connect(self) -> None:
+        self.connect_calls += 1
+        if self.connect_error:
+            raise uploader.AuthError(self.connect_error)
+        self.connected = True
+
+    def disconnect(self) -> None:
+        self.connected = False
+
+
+class FakeQueue:
+    def __init__(self, client=None, on_event=None) -> None:
+        self.client = client
+        self.on_event = on_event
+        self.submitted: list[tuple[Path, uploader.VideoMeta, Path | None]] = []
+        self.shutdown_calls = 0
+
+    def submit(self, clip, meta, session_dir=None) -> bool:
+        if uploader.is_posted(clip, session_dir) is not None:
+            return False
+        if any(c == clip for c, _m, _s in self.submitted):
+            return False
+        self.submitted.append((Path(clip), meta, session_dir))
+        return True
+
+    def pending(self) -> int:
+        return len(self.submitted)
+
+    def shutdown(self, wait=False, timeout_s=10.0) -> None:
+        self.shutdown_calls += 1
+
+
+@pytest.fixture
+def yt_window(app, tmp_path):
+    client = FakeYouTubeClient()
+    win = gui.MainWindow(
+        lambda cb: gui.FakeJobManager(cb), settings_path=tmp_path / "settings.json",
+        hardware_probe=lambda: "CPU", check_ffmpeg=lambda: True,
+        youtube_client_factory=lambda: client, upload_queue_factory=FakeQueue)
+    win.show()
+    win.fake_client = client
+    yield win
+    win.manager.shutdown()
+    win._disk_timer.stop()
+
+
+def _new_live(win) -> str:
+    win.url_edit.setText("https://www.twitch.tv/gaules")
+    win.add_live()
+    return next(iter(win._cards))
+
+
+def _enable_auto(win, value=True) -> None:
+    values = dict(win._settings)
+    values["youtube_auto_upload"] = value
+    win.apply_new_settings(values)
+
+
+def test_youtube_settings_defaults():
+    defaults = gui.default_settings()
+    assert defaults["youtube_privacy"] == config.YOUTUBE_PRIVACY
+    assert defaults["youtube_auto_upload"] is False
+    assert "youtube_privacy" in gui.SETTINGS_KEYS and "youtube_auto_upload" in gui.SETTINGS_KEYS
+
+
+def test_settings_dialog_youtube_values(app):
+    dialog = gui.SettingsDialog(gui.default_settings(), youtube_client=FakeYouTubeClient())
+    assert dialog.values()["youtube_auto_upload"] is False
+    dialog.youtube_privacy_combo.setCurrentIndex(dialog.youtube_privacy_combo.findData("private"))
+    dialog.youtube_auto_check.setChecked(True)
+    values = dialog.values()
+    assert values["youtube_privacy"] == "private" and values["youtube_auto_upload"] is True
+    assert [dialog.youtube_privacy_combo.itemText(i) for i in range(3)] == ["Público", "Não listado", "Privado"]
+
+
+def test_settings_dialog_youtube_status(app):
+    cases = [(dict(configured=False, connected=False), "Falta o arquivo de credencial"),
+             (dict(configured=True, connected=False), "Não conectado"),
+             (dict(configured=True, connected=True), "Conectado")]
+    for kwargs, text in cases:
+        dialog = gui.SettingsDialog(gui.default_settings(), youtube_client=FakeYouTubeClient(**kwargs))
+        dialog.show()
+        assert dialog.youtube_status_label.text() == text
+        connected = kwargs["connected"]
+        assert dialog.connect_button.isVisibleTo(dialog) is (not connected)
+        assert dialog.disconnect_button.isVisibleTo(dialog) is connected
+        dialog.close()
+
+
+def test_settings_dialog_connect_flow_installs_secret_then_logs_in(app, tmp_path, monkeypatch):
+    client = FakeYouTubeClient(configured=False, connected=False)
+    picked = tmp_path / "credencial.json"
+    asked = []
+    monkeypatch.setattr(gui.QFileDialog, "getOpenFileName",
+                        lambda *a, **k: asked.append(a[1]) or (str(picked), ""))
+    dialog = gui.SettingsDialog(gui.default_settings(), youtube_client=client)
+    dialog.show()
+    dialog.connect_button.click()
+    assert client.installed == [picked]
+    assert "credencial (.json)" in asked[0]
+    assert _wait_until(lambda: dialog.youtube_status_label.text() == "Conectado")
+    dialog.wait_login()
+    assert client.connect_calls == 1
+    assert dialog.disconnect_button.isVisibleTo(dialog)
+    dialog.disconnect_button.click()
+    assert dialog.youtube_status_label.text() == "Não conectado"
+    assert dialog.connect_button.isVisibleTo(dialog)
+    # já configurado: não pergunta o arquivo de novo
+    dialog.connect_button.click()
+    assert len(asked) == 1
+    dialog.wait_login()
+    dialog.close()
+
+
+def test_settings_dialog_login_message_while_waiting(app, monkeypatch):
+    gate = threading.Event()
+
+    class SlowClient(FakeYouTubeClient):
+        def connect(self):
+            gate.wait(5)
+            super().connect()
+
+    dialog = gui.SettingsDialog(gui.default_settings(), youtube_client=SlowClient(connected=False))
+    dialog.show()
+    dialog.connect_button.click()
+    assert "Abrimos o navegador" in dialog.youtube_message_label.text()
+    assert not dialog.connect_button.isEnabled()
+    gate.set()
+    assert _wait_until(lambda: dialog.youtube_status_label.text() == "Conectado")
+    dialog.wait_login()
+    dialog.close()
+
+
+def test_settings_dialog_connect_cancel_and_errors(app, tmp_path, monkeypatch):
+    client = FakeYouTubeClient(configured=False, connected=False)
+    monkeypatch.setattr(gui.QFileDialog, "getOpenFileName", lambda *a, **k: ("", ""))
+    dialog = gui.SettingsDialog(gui.default_settings(), youtube_client=client)
+    dialog.connect_button.click()
+    assert client.installed == [] and client.connect_calls == 0
+
+    def refuse(source):
+        raise uploader.AuthError('Essa credencial é do tipo "Aplicativo da Web".')
+
+    client.install_client_secret = refuse
+    monkeypatch.setattr(gui.QFileDialog, "getOpenFileName", lambda *a, **k: (str(tmp_path / "x.json"), ""))
+    dialog.show()
+    dialog.connect_button.click()
+    assert "Aplicativo da Web" in dialog.youtube_message_label.text()
+    assert client.connect_calls == 0
+
+    failing = FakeYouTubeClient(configured=True, connected=False, connect_error="Não deu para concluir o login")
+    second = gui.SettingsDialog(gui.default_settings(), youtube_client=failing)
+    second.show()
+    second.connect_button.click()
+    assert _wait_until(lambda: "Não deu para concluir" in second.youtube_message_label.text())
+    assert second.youtube_status_label.text() == "Não conectado"
+    second.wait_login()
+    assert second.connect_button.isEnabled()
+    dialog.close()
+    second.close()
+
+
+def test_settings_dialog_help_opens_readme(app, monkeypatch):
+    opened = []
+    monkeypatch.setattr(gui.QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
+    dialog = gui.SettingsDialog(gui.default_settings(), youtube_client=FakeYouTubeClient())
+    dialog.youtube_help_button.click()
+    assert opened and (opened[0].endswith("README.md") or opened[0] == gui.README_URL)
+    monkeypatch.setattr(gui.runtime, "app_dir", lambda: Path("pasta_que_nao_existe"))
+    dialog.youtube_help_button.click()
+    assert opened[1] == gui.README_URL and opened[1].endswith("#postar-no-youtube")
+
+
+def _yt_dialog(tmp_path, queue=None, n=3, **kwargs):
+    session = tmp_path / "sessao"
+    clips = _make_clips(session / "final", n)
+    dialog = gui.YouTubeDialog(clips, "gaules", "twitch", queue if queue is not None else FakeQueue(),
+                               session_dir=session, **kwargs)
+    return dialog, clips, session
+
+
+def test_youtube_dialog_lists_clips_with_titles_and_posted_state(app, tmp_path):
+    session = tmp_path / "sessao"
+    clips = _make_clips(session / "final", 3)
+    uploader.save_record(session, uploader.UploadRecord(
+        clips[0].name, "v1", "https://youtube.com/shorts/v1", "public", 1.0))
+    dialog = gui.YouTubeDialog(clips, "gaules", "twitch", FakeQueue(), session_dir=session)
+    assert dialog.windowTitle() == "Postar clipes de gaules no YouTube"
+    table = dialog.table
+    assert table.rowCount() == 3 and table.columnCount() == 4
+    assert [table.horizontalHeaderItem(c).text() for c in (1, 2)] == ["Clipe", "Título"]
+    posted_check = table.item(0, 0)
+    assert posted_check.checkState() == Qt.CheckState.Unchecked
+    assert not posted_check.flags() & Qt.ItemFlag.ItemIsUserCheckable
+    assert table.item(0, 2).text() == "postado · https://youtube.com/shorts/v1"
+    assert not table.item(0, 2).flags() & Qt.ItemFlag.ItemIsEditable
+    assert "clip_01.mp4" in table.item(0, 1).text()
+    assert table.item(1, 0).checkState() == Qt.CheckState.Checked
+    assert table.item(1, 2).flags() & Qt.ItemFlag.ItemIsEditable
+    assert table.item(1, 2).text() == "gaules | momento #2 da live #Shorts"
+    assert dialog.count_label.text().startswith("2 selecionados")
+    assert dialog.send_button.text() == "Postar 2 clipes"
+    assert "continuam em segundo plano" in dialog.footer_label.text()
+    dialog.select_none_button.click()
+    assert dialog.send_button.text() == "Nenhum selecionado" and not dialog.send_button.isEnabled()
+    dialog.select_all_button.click()
+    assert dialog.selected_clips() == clips[1:]       # o já postado nunca é marcado
+
+
+def test_youtube_dialog_double_click_opens_link_or_video(app, tmp_path, monkeypatch):
+    session = tmp_path / "sessao"
+    clips = _make_clips(session / "final", 2)
+    uploader.save_record(session, uploader.UploadRecord(
+        clips[0].name, "v1", "https://youtube.com/shorts/v1", "public", 1.0))
+    dialog = gui.YouTubeDialog(clips, "gaules", "twitch", FakeQueue(), session_dir=session)
+    opened = []
+    monkeypatch.setattr(gui.QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
+    dialog._open_cell(0, 1)
+    assert opened == ["https://youtube.com/shorts/v1"]
+    dialog._open_cell(1, 1)
+    assert opened[1].startswith("file:") and opened[1].endswith("clip_02.mp4")
+    dialog._open_cell(1, 2)                        # coluna do título: edição, não abre nada
+    assert len(opened) == 2
+
+
+def test_youtube_dialog_submits_edited_titles_and_combo_privacy(app, tmp_path):
+    queue = FakeQueue()
+    dialog, clips, session = _yt_dialog(tmp_path, queue, privacy="public")
+    assert dialog.privacy_combo.currentData() == "public"
+    dialog.table.item(1, 2).setText("Meu título <editado>")
+    dialog.table.item(2, 0).setCheckState(Qt.CheckState.Unchecked)
+    dialog.privacy_combo.setCurrentIndex(dialog.privacy_combo.findData("unlisted"))
+    assert dialog.send_button.text() == "Postar 2 clipes"
+    dialog.send_button.click()
+    assert [c for c, _m, _s in queue.submitted] == [clips[0], clips[1]]
+    assert all(s == session for _c, _m, s in queue.submitted)
+    assert queue.submitted[1][1].title == "Meu título editado"       # "<" e ">" removidos
+    assert all(m.privacy == "unlisted" for _c, m, _s in queue.submitted)
+    assert dialog.table.item(0, 3).text() == "na fila"
+    assert dialog.table.item(2, 3).text() == ""
+    assert dialog.selected_clips() == []                              # enviados saem da seleção
+    assert not dialog.table.item(0, 0).flags() & Qt.ItemFlag.ItemIsUserCheckable
+
+
+def test_youtube_dialog_progress_done_failed_and_private_warning(app, tmp_path):
+    queue = FakeQueue()
+    dialog, clips, session = _yt_dialog(tmp_path, queue, n=2, privacy="public")
+    dialog.send_button.click()
+    ev = uploader.UploadEvent
+    dialog.handle_event(ev("started", clips[0], total_bytes=1000))
+    assert dialog.table.item(0, 3).text() == "enviando 0%"
+    dialog.handle_event(ev("progress", clips[0], done_bytes=450, total_bytes=1000))
+    assert dialog.table.item(0, 3).text() == "enviando 45%"
+    record = uploader.UploadRecord(clips[0].name, "abc", "https://youtube.com/shorts/abc", "private", 1.0)
+    dialog.handle_event(ev("done", clips[0], record=record))
+    assert dialog.table.item(0, 3).text() == "postado"
+    assert dialog.table.item(0, 2).text() == "postado · https://youtube.com/shorts/abc"
+    assert dialog.warning_label.text() == ("O YouTube deixou o vídeo como privado. Projetos novos "
+                                           "podem precisar de verificação do Google.")
+    assert not dialog.warning_label.isHidden()
+    dialog.handle_event(ev("failed", clips[1], error="rede caiu", error_kind="other"))
+    assert dialog.table.item(1, 3).text() == "falhou: rede caiu"
+    assert dialog.table.item(1, 0).flags() & Qt.ItemFlag.ItemIsUserCheckable      # pode tentar de novo
+    dialog.handle_event(ev("progress", tmp_path / "outro.mp4", done_bytes=1, total_bytes=2))   # ignorado
+
+
+def test_youtube_dialog_no_warning_when_privacy_matches(app, tmp_path):
+    dialog, clips, _session = _yt_dialog(tmp_path, n=1, privacy="private")
+    dialog.send_button.click()
+    record = uploader.UploadRecord(clips[0].name, "abc", "https://youtube.com/shorts/abc", "private", 1.0)
+    dialog.handle_event(uploader.UploadEvent("done", clips[0], record=record))
+    assert dialog.warning_label.isHidden()
+
+
+def test_youtube_dialog_close_does_not_cancel_queue(app, tmp_path):
+    queue = FakeQueue()
+    dialog, _clips, _session = _yt_dialog(tmp_path, queue)
+    dialog.show()
+    dialog.send_button.click()
+    dialog.close()
+    assert queue.shutdown_calls == 0 and len(queue.submitted) == 3
+
+
+def test_youtube_dialog_not_connected_offers_settings(app, tmp_path):
+    dialog, _clips, _session = _yt_dialog(tmp_path, None, connected=False)
+    dialog.show()
+    assert dialog.not_connected_label.isVisibleTo(dialog)
+    assert not dialog.table.isVisibleTo(dialog) and not dialog.send_button.isVisibleTo(dialog)
+    asked = []
+    dialog.settings_requested.connect(lambda: asked.append(True))
+    dialog.settings_button.click()
+    assert asked == [True]
+    dialog.close()
+
+
+def test_card_youtube_action_opens_dialog_with_shared_queue(yt_window, tmp_path, monkeypatch):
+    job_id = _new_live(yt_window)
+    clips = _make_clips(tmp_path / "sessao" / "final", 2)
+    yt_window.manager.update(job_id, state=JobState.DONE, final_clips=tuple(clips),
+                             session_dir=tmp_path / "sessao")
+    shown = []
+    monkeypatch.setattr(gui.YouTubeDialog, "exec", lambda self: shown.append(self) or 0)
+    yt_window._cards[job_id].youtube_action.trigger()
+    assert len(shown) == 1 and shown[0].table.rowCount() == 2
+    assert shown[0]._queue is yt_window.upload_queue()
+    assert yt_window._youtube_dialog is None                      # solto depois do exec
+    yt_window.fake_client.connected = False
+    yt_window._cards[job_id].youtube_action.trigger()
+    assert not shown[1]._connected
+
+
+def test_auto_post_only_new_clips_and_never_duplicates(yt_window, tmp_path):
+    job_id = _new_live(yt_window)
+    clips = _make_clips(tmp_path / "sessao" / "final", 4)
+    session = tmp_path / "sessao"
+    # Opção desligada: o clipe 1 aparece e é só "visto".
+    yt_window.manager.update(job_id, state=JobState.RECORDING, final_clips=(clips[0],), session_dir=session)
+    assert yt_window._yt_queue is None
+    _enable_auto(yt_window, True)
+    # Ligou a opção: o clipe antigo NÃO é postado retroativamente; o novo é.
+    yt_window.manager.update(job_id, final_clips=(clips[0], clips[1]))
+    queue = yt_window.upload_queue()
+    assert [c for c, _m, _s in queue.submitted] == [clips[1]]
+    # Mesmo status de novo: não duplica.
+    yt_window.manager.update(job_id, message="gravando")
+    yt_window.manager.update(job_id, final_clips=(clips[0], clips[1], clips[2]))
+    assert [c for c, _m, _s in queue.submitted] == [clips[1], clips[2]]
+    meta = queue.submitted[0][1]
+    assert meta.title == "gaules | momento #2 da live #Shorts" and meta.privacy == config.YOUTUBE_PRIVACY
+    assert queue.submitted[0][2] == session
+
+
+def test_auto_post_respects_settings_connection_and_privacy(yt_window, tmp_path):
+    job_id = _new_live(yt_window)
+    clips = _make_clips(tmp_path / "sessao" / "final", 3)
+    values = dict(yt_window._settings, youtube_auto_upload=True, youtube_privacy="unlisted")
+    yt_window.apply_new_settings(values)
+    yt_window.fake_client.connected = False
+    yt_window.manager.update(job_id, state=JobState.RECORDING, final_clips=(clips[0],))
+    assert yt_window._yt_queue is None                           # sem login: nada é enfileirado
+    yt_window.fake_client.connected = True
+    yt_window.manager.update(job_id, final_clips=(clips[0], clips[1]))
+    queue = yt_window.upload_queue()
+    assert [c for c, _m, _s in queue.submitted] == [clips[1]]    # o 1 foi "visto" sem login
+    assert queue.submitted[0][1].privacy == "unlisted"
+    _enable_auto(yt_window, False)
+    yt_window.manager.update(job_id, final_clips=(clips[0], clips[1], clips[2]))
+    assert len(queue.submitted) == 1
+
+
+def test_auto_post_skips_clips_already_there_at_startup(app, tmp_path):
+    client, queues = FakeYouTubeClient(), []
+    settings = tmp_path / "settings.json"
+    gui.save_settings(dict(gui.default_settings(), youtube_auto_upload=True), settings)
+    clips = _make_clips(tmp_path / "sessao" / "final", 2)
+
+    def factory(cb):
+        manager = gui.FakeJobManager(cb)
+        manager._create("https://www.twitch.tv/gaules", "twitch", "gaules", JobState.DONE,
+                        "pronto", final_clips=tuple(clips), session_dir=tmp_path / "sessao")
+        return manager
+
+    win = gui.MainWindow(factory, settings_path=settings, hardware_probe=lambda: "CPU",
+                         check_ffmpeg=lambda: True, youtube_client_factory=lambda: client,
+                         upload_queue_factory=lambda c, cb: queues.append(FakeQueue(c, cb)) or queues[-1])
+    assert queues == []
+    win._disk_timer.stop()
+
+
+def test_upload_events_drive_card_text(yt_window, tmp_path):
+    job_id = _new_live(yt_window)
+    clips = _make_clips(tmp_path / "sessao" / "final", 2)
+    yt_window.manager.update(job_id, state=JobState.DONE, final_clips=tuple(clips))
+    card = yt_window._cards[job_id]
+    ev = uploader.UploadEvent
+    yt_window._on_upload_event(ev("queued", clips[0]))
+    yt_window._on_upload_event(ev("queued", clips[1]))
+    assert card.youtube_label.text() == "YouTube: enviando 1 de 2"
+    record = uploader.UploadRecord(clips[0].name, "a", "https://youtube.com/shorts/a", "public", 1.0)
+    yt_window._on_upload_event(ev("done", clips[0], record=record))
+    assert card.youtube_label.text() == "YouTube: enviando 2 de 2"
+    yt_window._on_upload_event(ev("done", clips[1], record=record))
+    assert card.youtube_label.text() == "YouTube: 2 postados"
+    assert card.youtube_label.isVisibleTo(card)
+
+
+def test_auth_failure_notifies_once_and_pauses_auto_post(yt_window, tmp_path):
+    job_id = _new_live(yt_window)
+    clips = _make_clips(tmp_path / "sessao" / "final", 3)
+    _enable_auto(yt_window, True)
+    yt_window.manager.update(job_id, state=JobState.RECORDING, final_clips=(clips[0],))
+    queue = yt_window.upload_queue()
+    ev = uploader.UploadEvent
+    yt_window._on_upload_event(ev("failed", clips[0], error="Login do YouTube expirou", error_kind="auth"))
+    assert not yt_window.notice_label.isHidden() and "login expirou" in yt_window.notice_label.text()
+    yt_window.notice_label.setText("já li")
+    yt_window._on_upload_event(ev("failed", clips[1], error="Login do YouTube expirou", error_kind="auth"))
+    assert yt_window.notice_label.text() == "já li"                # não repete o aviso
+    yt_window.manager.update(job_id, final_clips=(clips[0], clips[1]))
+    assert len(queue.submitted) == 1                               # auto-post em pausa
+    assert yt_window._auto_post_blocked
+
+
+def test_quota_failure_notice_and_done_clears_it(yt_window, tmp_path):
+    job_id = _new_live(yt_window)
+    clips = _make_clips(tmp_path / "sessao" / "final", 1)
+    yt_window.manager.update(job_id, final_clips=tuple(clips))
+    ev = uploader.UploadEvent
+    yt_window._on_upload_event(ev("failed", clips[0], error="Cota", error_kind="quota"))
+    assert "cota diária" in yt_window.notice_label.text()
+    assert not yt_window._auto_post_blocked                        # cota não desliga o auto-post
+    record = uploader.UploadRecord(clips[0].name, "a", "https://youtube.com/shorts/a", "public", 1.0)
+    yt_window._on_upload_event(ev("done", clips[0], record=record))
+    assert yt_window.notice_label.isHidden()
+
+
+def test_open_settings_reconnect_resumes_auto_post(yt_window, monkeypatch):
+    yt_window._auto_post_blocked = True
+    monkeypatch.setattr(gui.SettingsDialog, "exec", lambda self: 0)
+    yt_window.fake_client.connected = False
+    yt_window.open_settings()
+    assert yt_window._auto_post_blocked
+    yt_window.fake_client.connected = True
+    yt_window.open_settings()
+    assert not yt_window._auto_post_blocked
+
+
+def test_close_shuts_down_upload_queue(yt_window, monkeypatch):
+    from PySide6.QtGui import QCloseEvent
+    queue = yt_window.upload_queue()
+    clip = Path("a/final/clip_01.mp4")
+    queue.submit(clip, uploader.build_meta(clip, channel="c", platform="twitch"))
+    asked = []
+    monkeypatch.setattr(yt_window, "confirm", lambda title, text: asked.append(text) or True)
+    event = QCloseEvent()
+    yt_window.closeEvent(event)
+    assert event.isAccepted() and queue.shutdown_calls == 1
+    assert asked and "YouTube" in asked[0]

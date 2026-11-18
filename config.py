@@ -113,6 +113,26 @@ EXPORT_AUTO = "auto"
 EXPORT_SUBFOLDER = "Auto-Clipper"           # dentro do Drive: Meu Drive\Auto-Clipper\<live>\
 DRIVE_ROOT_NAMES = ("Meu Drive", "My Drive")
 
+# --- Postar no YouTube (ADR-012) ----------------------------------------
+# Opcional. Precisa de uma credencial SUA do Google Cloud (passo a passo no README).
+YOUTUBE_PRIVACY = "public"          # "public" | "unlisted" | "private"
+YOUTUBE_AUTO_UPLOAD = False         # posta sozinho cada clipe novo assim que fica pronto
+# Campos: {channel}, {platform}, {n} (número do clipe), {date} (dd/mm/aaaa)
+YOUTUBE_TITLE_TEMPLATE = "{channel} | momento #{n} da live #Shorts"
+YOUTUBE_DESCRIPTION_TEMPLATE = (
+    "Melhor momento da live de {channel} na {platform} ({date}).\n\n"
+    "#Shorts #{channel} #clipes"
+)
+YOUTUBE_TAGS = ("shorts", "clipes", "live", "melhores momentos")
+YOUTUBE_CATEGORY_ID = "20"          # 20 = Jogos; 24 = Entretenimento
+YOUTUBE_CLIENT_SECRET_FILE = "youtube_client_secret.json"   # em %LOCALAPPDATA%\Auto-Clipper
+YOUTUBE_TOKEN_FILE = "youtube_token.json"
+YOUTUBE_CHUNK_BYTES = 8 * 1024 * 1024   # múltiplo de 256 KiB (exigência do upload retomável)
+YOUTUBE_MAX_RETRIES = 6
+YOUTUBE_RETRY_BASE_S = 2.0
+YOUTUBE_LOGIN_TIMEOUT_S = 300
+YOUTUBE_HTTP_TIMEOUT_S = 60           # timeout de cada requisição HTTP do upload
+
 # --- Saída --------------------------------------------------------------
 SESSIONS_DIR = "sessions"
 DELETE_RAW_AFTER_PROCESS = False   # apaga os .ts depois de gerar os clipes finais

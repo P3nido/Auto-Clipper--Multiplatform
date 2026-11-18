@@ -28,10 +28,14 @@ for pkg in (
 # Plugins do streamlink são carregados dinamicamente; trio* para o webbrowser (Kick).
 hiddenimports += collect_submodules("streamlink.plugins")
 hiddenimports += collect_submodules("streamlink.webbrowser")
+# Postar no YouTube (ADR-012): google-auth carrega transportes/credenciais dinamicamente.
+for pkg in ("google.auth", "google.oauth2", "google_auth_oauthlib", "requests_oauthlib", "oauthlib"):
+    hiddenimports += collect_submodules(pkg)
 hiddenimports += ["trio", "trio_websocket", "wsproto", "outcome", "sniffio", "exceptiongroup"]
 # Módulos do projeto importados dentro de funções.
 hiddenimports += ["config", "runtime", "main", "gui", "engine", "hardware", "transcriber",
-                  "clipper", "recorder", "chat_listener", "hype_detector", "session", "exporter"]
+                  "clipper", "recorder", "chat_listener", "hype_detector", "session", "exporter",
+                  "uploader"]
 
 # DLLs CUDA (cuBLAS/cuDNN) do venv -> _internal/nvidia/<pacote>/bin (runtime.nvidia_dll_dirs).
 import sysconfig

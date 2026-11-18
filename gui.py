@@ -31,20 +31,22 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QEventLoop, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 import config
 import exporter
 import runtime
+import uploader
 from chat_listener import channel_from_url, detect_platform
 from engine import JobState, JobStatus
 
 __all__ = [
     "FakeJobManager", "MainWindow", "JobCard", "SettingsDialog", "ExportDialog",
-    "load_settings", "save_settings", "apply_settings", "main",
+    "YouTubeDialog", "load_settings", "save_settings", "apply_settings", "main",
 ]
 
 logger = logging.getLogger(__name__)
@@ -91,8 +93,12 @@ LAYOUT_CHOICES = (
 )
 LANGUAGE_CHOICES = (("Português", "pt"), ("Detectar automaticamente", None))
 SENSITIVITY_CHOICES = (("Baixa (só momentos enormes)", 3.0), ("Média", 2.2), ("Alta (recomendado)", 1.8), ("Máxima", 1.5))
+YOUTUBE_PRIVACY_CHOICES = (("Público", "public"), ("Não listado", "unlisted"), ("Privado", "private"))
 SETTINGS_KEYS = ("output_layout", "whisper_language", "spike_multiplier", "sessions_dir",
-                 "export_dir")
+                 "export_dir", "youtube_privacy", "youtube_auto_upload")
+README_URL = "https://github.com/P3nido/Auto-Clipper--Multiplatform#postar-no-youtube"
+YOUTUBE_PRIVATE_WARNING = ("O YouTube deixou o vídeo como privado. Projetos novos podem precisar "
+                           "de verificação do Google.")
 
 
 def default_settings() -> dict:
@@ -104,6 +110,8 @@ def default_settings() -> dict:
         "spike_multiplier": float(config.SPIKE_MULTIPLIER),
         "sessions_dir": config.SESSIONS_DIR,
         "export_dir": config.EXPORT_DIR,
+        "youtube_privacy": config.YOUTUBE_PRIVACY,
+        "youtube_auto_upload": bool(config.YOUTUBE_AUTO_UPLOAD),
     }
 
 STATE_TITLES = {
@@ -159,12 +167,24 @@ def apply_settings(settings: dict) -> None:
     config.SPIKE_MULTIPLIER = float(settings["spike_multiplier"])
     config.SESSIONS_DIR = settings["sessions_dir"]
     config.EXPORT_DIR = settings["export_dir"]
+    config.YOUTUBE_PRIVACY = settings["youtube_privacy"]
+    config.YOUTUBE_AUTO_UPLOAD = bool(settings["youtube_auto_upload"])
 
 
 # ─────────────────────────────── utilidades ──────────────────────────────────
 def open_folder(path: Path) -> None:
     """Abre a pasta no Explorer (ou no gerenciador de arquivos do sistema)."""
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+
+def open_readme_section() -> None:
+    """Abre o passo a passo de "Postar no YouTube": o README.md ao lado do app, se existir;
+    senão a página do projeto no GitHub."""
+    readme = runtime.app_dir() / "README.md"
+    if readme.is_file():
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(readme)))
+    else:
+        QDesktopServices.openUrl(QUrl(README_URL))
 
 
 def ffmpeg_available() -> bool:
@@ -349,6 +369,16 @@ class ExportBridge(QObject):
     failed = Signal(str)
 
 
+class YouTubeBridge(QObject):
+    """Leva os UploadEvent da thread da fila de envio para o thread da UI."""
+    event = Signal(object)
+
+
+class LoginBridge(QObject):
+    """Resultado do login do Google (thread gui-yt-login): texto vazio = deu certo."""
+    finished = Signal(str)
+
+
 class StatBlock(QWidget):
     """Número grande (fonte condensada) com legenda pequena embaixo."""
 
@@ -374,7 +404,8 @@ class JobCard(QFrame):
 
     stop_requested = Signal(str)
     open_requested = Signal(str)
-    export_requested = Signal(str)
+    export_requested = Signal(str)       # menu Enviar > Google Drive
+    youtube_requested = Signal(str)      # menu Enviar > YouTube
     remove_requested = Signal(str)
 
     def __init__(self, status: JobStatus) -> None:
@@ -413,6 +444,11 @@ class JobCard(QFrame):
         self.message_label.setObjectName("message")
         self.message_label.setWordWrap(True)
         info.addWidget(self.message_label)
+        self.youtube_label = QLabel()
+        self.youtube_label.setObjectName("message")
+        self.youtube_label.setWordWrap(True)
+        self.youtube_label.setVisible(False)
+        info.addWidget(self.youtube_label)
 
         self.progress = QProgressBar()
         self.progress.setTextVisible(False)
@@ -455,7 +491,11 @@ class JobCard(QFrame):
         buttons.setSpacing(8)
         self.stop_button = QPushButton("Parar")
         self.open_button = QPushButton("Abrir clipes")
-        self.export_button = QPushButton("Enviar ao Drive")
+        self.export_button = QPushButton("Enviar ▾")
+        send_menu = QMenu(self.export_button)
+        self.drive_action = send_menu.addAction("Google Drive")
+        self.youtube_action = send_menu.addAction("YouTube")
+        self.export_button.setMenu(send_menu)
         self.remove_button = QPushButton("Remover")
         self.remove_button.setObjectName("ghost")
         for button in (self.stop_button, self.open_button, self.export_button, self.remove_button):
@@ -466,7 +506,8 @@ class JobCard(QFrame):
         root.addLayout(buttons)
         self.stop_button.clicked.connect(lambda: self.stop_requested.emit(self.job_id))
         self.open_button.clicked.connect(lambda: self.open_requested.emit(self.job_id))
-        self.export_button.clicked.connect(lambda: self.export_requested.emit(self.job_id))
+        self.drive_action.triggered.connect(lambda: self.export_requested.emit(self.job_id))
+        self.youtube_action.triggered.connect(lambda: self.youtube_requested.emit(self.job_id))
         self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self.job_id))
 
     # --- estado ---
@@ -522,6 +563,11 @@ class JobCard(QFrame):
         self.export_button.setEnabled(has_clips)
         self.export_button.setToolTip("" if has_clips else "Os clipes aparecem aqui quando ficarem prontos.")
         self._set_property(self.open_button, "primary", "true" if state == JobState.DONE and has_clips else "false")
+
+    def set_youtube_text(self, text: str) -> None:
+        """Texto discreto do andamento da postagem no YouTube (vazio esconde)."""
+        self.youtube_label.setText(text)
+        self.youtube_label.setVisible(bool(text))
 
     @staticmethod
     def _set_property(widget: QWidget, name: str, value: str) -> None:
@@ -579,12 +625,18 @@ class EmptyState(QWidget):
 
 
 class SettingsDialog(QDialog):
-    """Ajustes simples. `values()` devolve o dict no formato do settings.json."""
+    """Ajustes simples. `values()` devolve o dict no formato do settings.json.
 
-    def __init__(self, settings: dict, parent: QWidget | None = None) -> None:
+    `youtube_client` (injeção para testes) é o uploader.YouTubeClient usado na seção YouTube;
+    sem ele, cria um cliente padrão."""
+
+    def __init__(self, settings: dict, parent: QWidget | None = None, *,
+                 youtube_client: object | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Ajustes")
         self.setMinimumWidth(480)
+        self._yt_client = youtube_client if youtube_client is not None else uploader.YouTubeClient()
+        self._login_thread: threading.Thread | None = None
         form = QFormLayout()
         form.setVerticalSpacing(14)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
@@ -600,11 +652,17 @@ class SettingsDialog(QDialog):
         dir_row.addWidget(self.dir_edit, 1)
         dir_row.addWidget(browse)
 
+        form.addRow(self._section_title("Clipes"))
         form.addRow("Formato do clipe", self.layout_combo)
         form.addRow("Idioma da legenda", self.language_combo)
         form.addRow("Sensibilidade dos picos", self.sensitivity_combo)
         form.addRow("Pasta de saída", dir_row)
+        hint = QLabel("Sensibilidade alta gera mais clipes, com momentos menos fortes.")
+        hint.setObjectName("message")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
 
+        form.addRow(self._section_title("Google Drive"))
         current_export = str(settings.get("export_dir") or config.EXPORT_AUTO)
         self.export_edit = QLineEdit("" if current_export == config.EXPORT_AUTO else current_export)
         self.export_edit.setPlaceholderText("Automático")
@@ -625,9 +683,34 @@ class SettingsDialog(QDialog):
         form.addRow("", self.export_label)
         self.export_edit.textChanged.connect(self._refresh_export_label)
         self._refresh_export_label()
-        hint = QLabel("Sensibilidade alta gera mais clipes, com momentos menos fortes.")
-        hint.setObjectName("message")
-        hint.setWordWrap(True)
+
+        form.addRow(self._section_title("YouTube"))
+        self.youtube_status_label = QLabel()
+        self.connect_button = QPushButton("Conectar…")
+        self.connect_button.clicked.connect(self._connect_youtube)
+        self.disconnect_button = QPushButton("Desconectar")
+        self.disconnect_button.setObjectName("ghost")
+        self.disconnect_button.clicked.connect(self._disconnect_youtube)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.youtube_status_label, 1)
+        status_row.addWidget(self.connect_button)
+        status_row.addWidget(self.disconnect_button)
+        form.addRow("Conta do YouTube", status_row)
+        self.youtube_message_label = QLabel()
+        self.youtube_message_label.setObjectName("message")
+        self.youtube_message_label.setWordWrap(True)
+        self.youtube_message_label.setVisible(False)
+        form.addRow("", self.youtube_message_label)
+        self.youtube_privacy_combo = self._combo(YOUTUBE_PRIVACY_CHOICES, settings["youtube_privacy"])
+        form.addRow("Visibilidade", self.youtube_privacy_combo)
+        self.youtube_auto_check = QCheckBox("Postar automaticamente cada clipe novo")
+        self.youtube_auto_check.setChecked(bool(settings["youtube_auto_upload"]))
+        form.addRow("", self.youtube_auto_check)
+        self.youtube_help_button = QPushButton("Como criar a credencial")
+        self.youtube_help_button.setObjectName("ghost")
+        self.youtube_help_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.youtube_help_button.clicked.connect(open_readme_section)
+        form.addRow("", self.youtube_help_button)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("Salvar")
@@ -640,8 +723,17 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(24, 24, 24, 20)
         layout.setSpacing(16)
         layout.addLayout(form)
-        layout.addWidget(hint)
         layout.addWidget(buttons)
+
+        self._login_bridge = LoginBridge()
+        self._login_bridge.finished.connect(self._on_login_finished)
+        self.refresh_youtube_status()
+
+    @staticmethod
+    def _section_title(text: str) -> QLabel:
+        label = QLabel(text.upper())
+        label.setObjectName("sectionTitle")
+        return label
 
     @staticmethod
     def _combo(choices, current) -> QComboBox:
@@ -680,6 +772,83 @@ class SettingsDialog(QDialog):
         else:
             self.export_label.setText(f"Os clipes vão para: {resolved}")
 
+    # --- YouTube ---
+    def refresh_youtube_status(self) -> None:
+        connected = self._yt_client.is_connected()
+        if connected:
+            text = "Conectado"
+        elif not self._yt_client.is_configured():
+            text = "Falta o arquivo de credencial"
+        else:
+            text = "Não conectado"
+        self.youtube_status_label.setText(text)
+        logging_in = self._login_thread is not None and self._login_thread.is_alive()
+        self.connect_button.setVisible(not connected)
+        self.connect_button.setEnabled(not logging_in)
+        self.disconnect_button.setVisible(connected)
+
+    def _set_youtube_message(self, text: str) -> None:
+        self.youtube_message_label.setText(text)
+        self.youtube_message_label.setVisible(bool(text))
+
+    def _connect_youtube(self) -> None:
+        if self._login_thread is not None and self._login_thread.is_alive():
+            return
+        self._set_youtube_message("")
+        if not self._yt_client.is_configured():
+            path, _filter = QFileDialog.getOpenFileName(
+                self, "Escolha o arquivo de credencial (.json) baixado do Google Cloud",
+                str(Path.home() / "Downloads"), "Credencial do Google (*.json)")
+            if not path:
+                return
+            try:
+                self._yt_client.install_client_secret(Path(path))
+            except uploader.UploadError as exc:       # AuthError é um UploadError
+                self._set_youtube_message(str(exc))
+                self.refresh_youtube_status()
+                return
+        self._set_youtube_message("Abrimos o navegador: entre na sua conta do Google e autorize "
+                                  "o Auto-Clipper. Esta janela espera até você terminar.")
+        client, bridge = self._yt_client, self._login_bridge
+
+        def work() -> None:
+            try:
+                client.connect()
+                result = ""
+            except uploader.UploadError as exc:
+                result = str(exc) or "Não deu para concluir o login."
+            except Exception as exc:  # noqa: BLE001 - a thread nunca morre calada
+                logger.exception("Erro inesperado no login do YouTube")
+                result = f"Erro inesperado no login: {exc}"
+            try:
+                bridge.finished.emit(result)
+            except RuntimeError:      # janela já destruída
+                logger.debug("Ajustes fechados antes do fim do login")
+
+        self._login_thread = threading.Thread(target=work, name="gui-yt-login", daemon=True)
+        self._login_thread.start()
+        self.refresh_youtube_status()
+
+    def _on_login_finished(self, error: str) -> None:
+        self._login_thread = None
+        if error:
+            self._set_youtube_message(error)
+        else:
+            self._set_youtube_message("Conta conectada. Os clipes podem ser postados pelo botão Enviar.")
+        self.refresh_youtube_status()
+
+    def _disconnect_youtube(self) -> None:
+        try:
+            self._yt_client.disconnect()
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao desconectar o YouTube")
+        self._set_youtube_message("")
+        self.refresh_youtube_status()
+
+    def wait_login(self, timeout_s: float = 5.0) -> None:
+        if self._login_thread is not None:
+            self._login_thread.join(timeout_s)
+
     def values(self) -> dict:
         return {
             "output_layout": self.layout_combo.currentData(),
@@ -687,6 +856,8 @@ class SettingsDialog(QDialog):
             "spike_multiplier": self.sensitivity_combo.currentData(),
             "sessions_dir": self.dir_edit.text().strip() or default_settings()["sessions_dir"],
             "export_dir": self.export_edit.text().strip() or config.EXPORT_AUTO,
+            "youtube_privacy": self.youtube_privacy_combo.currentData(),
+            "youtube_auto_upload": self.youtube_auto_check.isChecked(),
         }
 
 
@@ -906,12 +1077,294 @@ class ExportDialog(QDialog):
         super().reject()
 
 
+class YouTubeDialog(QDialog):
+    """Escolha de clipes para postar no YouTube (ADR-012).
+
+    Não envia nada sozinha: entrega cada clipe à `UploadQueue` compartilhada da janela
+    principal e mostra o andamento pelos eventos que a janela repassa a `handle_event`.
+    Fechar a janela NÃO cancela a fila: os envios seguem em segundo plano."""
+
+    settings_requested = Signal()
+    COL_CHECK, COL_CLIP, COL_TITLE, COL_STATE = range(4)
+
+    def __init__(self, clips: list[Path], channel: str, platform: str, queue: object | None, *,
+                 session_dir: Path | None = None, connected: bool = True,
+                 privacy: str | None = None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.clips = [Path(c) for c in clips]
+        self.channel = channel
+        self.platform = platform
+        self.session_dir = Path(session_dir) if session_dir is not None else None
+        self._queue = queue
+        self._rows: dict[Path, int] = {}
+        self._requested: dict[Path, str] = {}
+        self._posted_urls: dict[int, str] = {}
+        self._locked: set[int] = set()
+        self.setWindowTitle(f"Postar clipes de {channel} no YouTube")
+        self.setMinimumWidth(720)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 20)
+        layout.setSpacing(12)
+        title = QLabel(f"Postar clipes de {channel} no YouTube")
+        title.setObjectName("channel")
+        layout.addWidget(title)
+
+        self.not_connected_label = QLabel(
+            "O YouTube ainda não está conectado. Conecte a sua conta em Ajustes para postar os clipes.")
+        self.not_connected_label.setObjectName("message")
+        self.not_connected_label.setWordWrap(True)
+        self.settings_button = QPushButton("Abrir Ajustes")
+        self.settings_button.setObjectName("primary")
+        self.settings_button.clicked.connect(self.settings_requested.emit)
+        layout.addWidget(self.not_connected_label)
+        layout.addWidget(self.settings_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["", "Clipe", "Título", "Estado"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setMinimumHeight(240)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                                   | QAbstractItemView.EditTrigger.EditKeyPressed)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(self.COL_CHECK, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_CLIP, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_TITLE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_STATE, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.itemChanged.connect(lambda _item: self._update_selection())
+        self.table.cellDoubleClicked.connect(self._open_cell)
+        layout.addWidget(self.table, 1)
+
+        tools = QHBoxLayout()
+        self.select_all_button = QPushButton("Marcar todos")
+        self.select_none_button = QPushButton("Desmarcar todos")
+        for button in (self.select_all_button, self.select_none_button):
+            button.setObjectName("ghost")
+            tools.addWidget(button)
+        self.select_all_button.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+        self.select_none_button.clicked.connect(lambda: self._set_all(Qt.CheckState.Unchecked))
+        tools.addStretch(1)
+        self.privacy_combo = QComboBox()
+        for label, value in YOUTUBE_PRIVACY_CHOICES:
+            self.privacy_combo.addItem(label, value)
+        self.privacy_combo.setCurrentIndex(
+            max(0, self.privacy_combo.findData(privacy or config.YOUTUBE_PRIVACY)))
+        tools.addWidget(QLabel("Visibilidade"))
+        tools.addWidget(self.privacy_combo)
+        self.count_label = QLabel()
+        self.count_label.setObjectName("message")
+        tools.addWidget(self.count_label)
+        layout.addLayout(tools)
+
+        self.status_label = QLabel()
+        self.status_label.setObjectName("message")
+        self.status_label.setWordWrap(True)
+        self.status_label.setVisible(False)
+        layout.addWidget(self.status_label)
+        self.warning_label = QLabel()
+        self.warning_label.setObjectName("formError")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setVisible(False)
+        layout.addWidget(self.warning_label)
+        self.footer_label = QLabel("Pode fechar esta janela: os envios continuam em segundo plano "
+                                   "e o cartão da live mostra o andamento.")
+        self.footer_label.setObjectName("message")
+        self.footer_label.setWordWrap(True)
+        layout.addWidget(self.footer_label)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.close_button = QPushButton("Fechar")
+        self.close_button.setObjectName("ghost")
+        self.close_button.clicked.connect(self.close)
+        self.send_button = QPushButton("Nenhum selecionado")
+        self.send_button.setObjectName("primary")
+        self.send_button.clicked.connect(self.start_upload)
+        buttons.addWidget(self.close_button)
+        buttons.addWidget(self.send_button)
+        layout.addLayout(buttons)
+
+        self._connected = bool(connected) and queue is not None
+        for widget in (self.table, self.select_all_button, self.select_none_button,
+                       self.privacy_combo, self.count_label, self.send_button, self.footer_label):
+            widget.setVisible(self._connected)
+        self.not_connected_label.setVisible(not self._connected)
+        self.settings_button.setVisible(not self._connected)
+        if self._connected:
+            self._fill_table()
+
+    # --- tabela ---
+    @staticmethod
+    def _size_of(clip: Path) -> int:
+        try:
+            return clip.stat().st_size
+        except OSError:
+            return 0
+
+    def _fill_table(self) -> None:
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self.clips))
+        for row, clip in enumerate(self.clips):
+            self._rows[clip] = row
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            name = QTableWidgetItem(f"{clip.name}  ·  {format_size(self._size_of(clip))}")
+            name.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            name.setData(Qt.ItemDataRole.UserRole, str(clip))
+            title = QTableWidgetItem()
+            state = QTableWidgetItem()
+            state.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            for col, item in enumerate((check, name, title, state)):
+                self.table.setItem(row, col, item)
+            record = uploader.is_posted(clip, self.session_dir)
+            if record is not None:
+                self._mark_posted(row, record)
+            else:
+                meta = uploader.build_meta(clip, channel=self.channel, platform=self.platform,
+                                           privacy=self.privacy_combo.currentData())
+                title.setText(meta.title)
+                title.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                               | Qt.ItemFlag.ItemIsEditable)
+                check.setCheckState(Qt.CheckState.Checked)
+        self.table.blockSignals(False)
+        self._update_selection()
+
+    def _mark_posted(self, row: int, record: uploader.UploadRecord) -> None:
+        """Linha já postada: desmarcada, não editável, com o link no lugar do título."""
+        check, name, title, state = (self.table.item(row, c) for c in range(4))
+        check.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        check.setCheckState(Qt.CheckState.Unchecked)
+        title.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        title.setText(f"postado · {record.url}")
+        state.setText("postado")
+        self._posted_urls[row] = record.url
+        self._locked.discard(row)
+
+    def _set_row_locked(self, row: int, locked: bool) -> None:
+        """Enquanto está na fila/enviando, a linha não pode ser marcada nem editada."""
+        check, _name, title, _state = (self.table.item(row, c) for c in range(4))
+        check.setFlags(Qt.ItemFlag.ItemIsEnabled if locked
+                       else Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+        base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        title.setFlags(base if locked else base | Qt.ItemFlag.ItemIsEditable)
+        (self._locked.add if locked else self._locked.discard)(row)
+
+    def _set_state(self, clip: Path, text: str) -> None:
+        row = self._rows.get(clip)
+        if row is not None:
+            self.table.blockSignals(True)
+            self.table.item(row, self.COL_STATE).setText(text)
+            self.table.blockSignals(False)
+
+    def _checked_rows(self) -> list[int]:
+        return [r for r in range(self.table.rowCount())
+                if r not in self._posted_urls and r not in self._locked
+                and self.table.item(r, self.COL_CHECK).checkState() == Qt.CheckState.Checked]
+
+    def selected_clips(self) -> list[Path]:
+        return [self.clips[r] for r in self._checked_rows()]
+
+    def titles(self) -> dict[Path, str]:
+        return {self.clips[r]: self.table.item(r, self.COL_TITLE).text() for r in self._checked_rows()}
+
+    def _set_all(self, state: Qt.CheckState) -> None:
+        self.table.blockSignals(True)
+        for row in range(self.table.rowCount()):
+            if row not in self._posted_urls and row not in self._locked:
+                self.table.item(row, self.COL_CHECK).setCheckState(state)
+        self.table.blockSignals(False)
+        self._update_selection()
+
+    def _update_selection(self) -> None:
+        selected = self.selected_clips()
+        n = len(selected)
+        total = sum(self._size_of(c) for c in selected)
+        self.count_label.setText(f"{n} selecionados ({format_size(total)})")
+        self.send_button.setText("Nenhum selecionado" if n == 0
+                                 else "Postar 1 clipe" if n == 1 else f"Postar {n} clipes")
+        self.send_button.setEnabled(n > 0)
+
+    def _open_cell(self, row: int, column: int) -> None:
+        url = self._posted_urls.get(row)
+        if url is not None:
+            QDesktopServices.openUrl(QUrl(url))
+        elif column == self.COL_CLIP:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.clips[row])))
+
+    # --- envio ---
+    def start_upload(self) -> None:
+        """Entrega à fila os clipes marcados, com o título editado e a visibilidade do combo."""
+        if not self._connected or self._queue is None:
+            return
+        privacy = self.privacy_combo.currentData()
+        titles = self.titles()
+        self.warning_label.setVisible(False)
+        self.table.blockSignals(True)
+        for clip, title in titles.items():
+            row = self._rows[clip]
+            meta = uploader.build_meta(clip, channel=self.channel, platform=self.platform,
+                                       privacy=privacy, title=title)
+            self._requested[clip] = privacy
+            accepted = self._queue.submit(clip, meta, self.session_dir)
+            if accepted:
+                self.table.item(row, self.COL_STATE).setText("na fila")
+                self.table.item(row, self.COL_CHECK).setCheckState(Qt.CheckState.Unchecked)
+                self._set_row_locked(row, True)
+            else:
+                record = uploader.is_posted(clip, self.session_dir)
+                if record is not None:
+                    self._mark_posted(row, record)
+                else:
+                    self.table.item(row, self.COL_STATE).setText("já está na fila")
+                    self.table.item(row, self.COL_CHECK).setCheckState(Qt.CheckState.Unchecked)
+        self.table.blockSignals(False)
+        self._update_selection()
+        sent = len(titles)
+        self.status_label.setText(f"{sent} clipe enviado para a fila." if sent == 1
+                                  else f"{sent} clipes enviados para a fila.")
+        self.status_label.setVisible(sent > 0)
+
+    def handle_event(self, event: uploader.UploadEvent) -> None:
+        """Repassado pela janela principal (thread da UI) para cada UploadEvent da fila."""
+        row = self._rows.get(Path(event.clip))
+        if row is None or not self._connected:
+            return
+        clip = Path(event.clip)
+        if event.kind == "queued":
+            self._set_state(clip, "na fila")
+        elif event.kind == "started":
+            self._set_state(clip, "enviando 0%")
+        elif event.kind == "progress":
+            pct = int(event.done_bytes * 100 / event.total_bytes) if event.total_bytes else 0
+            self._set_state(clip, f"enviando {pct}%")
+        elif event.kind == "done" and event.record is not None:
+            self.table.blockSignals(True)
+            self._mark_posted(row, event.record)
+            self.table.blockSignals(False)
+            self._update_selection()
+            requested = self._requested.get(clip)
+            if event.record.privacy == "private" and requested not in (None, "private"):
+                self.warning_label.setText(YOUTUBE_PRIVATE_WARNING)
+                self.warning_label.setVisible(True)
+        elif event.kind == "failed":
+            self._set_state(clip, f"falhou: {event.error or 'erro desconhecido'}")
+            self.table.blockSignals(True)
+            self._set_row_locked(row, False)
+            self.table.blockSignals(False)
+            self._update_selection()
+
+
 # ───────────────────────────────── janela principal ──────────────────────────
 class MainWindow(QWidget):
     def __init__(self, manager_factory: Callable[[Callable[[JobStatus], None]], object],
                  settings_path: Path = SETTINGS_PATH,
                  hardware_probe: Callable[[], str] = detect_hardware_text,
-                 check_ffmpeg: Callable[[], bool] = ffmpeg_available) -> None:
+                 check_ffmpeg: Callable[[], bool] = ffmpeg_available, *,
+                 youtube_client_factory: Callable[[], object] = uploader.YouTubeClient,
+                 upload_queue_factory: Callable[[object, Callable[[object], None]], object] = uploader.UploadQueue,
+                 ) -> None:
         super().__init__()
         self.setWindowTitle("Auto-Clipper")
         self.setMinimumSize(*MIN_WINDOW_SIZE)
@@ -919,6 +1372,24 @@ class MainWindow(QWidget):
         self._settings = load_settings(self._settings_path)
         apply_settings(self._settings)
         self._cards: dict[str, JobCard] = {}
+
+        # YouTube (ADR-012): cliente e fila são criados só quando alguém precisa deles.
+        self._youtube_client_factory = youtube_client_factory
+        self._upload_queue_factory = upload_queue_factory
+        self._yt_client: object | None = None
+        self._yt_queue: object | None = None
+        self._yt_bridge = YouTubeBridge()
+        self._yt_bridge.event.connect(self._on_upload_event)
+        self._youtube_dialog: YouTubeDialog | None = None
+        self._clip_jobs: dict[Path, str] = {}                  # clipe -> job_id (para achar o cartão)
+        self._clip_states: dict[str, dict[Path, str]] = {}     # job_id -> clipe -> estado do envio
+        # Auto-post: guarda TODO clipe já visto, com a opção ligada ou não. Assim, ligar a opção
+        # depois só posta os clipes que surgirem a partir dali (nada retroativo, nem das lives
+        # que já estavam na tela quando o app abriu).
+        self._seen_clips: set[Path] = set()
+        self._auto_post_ready = False          # só vale depois do snapshot inicial das lives
+        self._auto_post_blocked = False        # login expirou: pausa o auto-post até reconectar
+        self._notified: set[str] = set()       # avisos de auth/cota já mostrados
 
         self._bridge = UpdateBridge()
         self._bridge.updated.connect(self._on_status)
@@ -931,6 +1402,7 @@ class MainWindow(QWidget):
         self._disk_timer.start(DISK_REFRESH_MS)
         for status in self.manager.all():       # lives que já existiam (ex.: demo)
             self._on_status(status)
+        self._auto_post_ready = True
         self._refresh_visibility()
         self.refresh_footer()
 
@@ -1010,8 +1482,11 @@ class MainWindow(QWidget):
         self.hardware_label = QLabel("Detectando placa de vídeo…")
         self.disk_label = QLabel()
         self.lives_label = QLabel()
+        self.notice_label = QLabel()          # avisos do YouTube (login expirado, cota)
+        self.notice_label.setVisible(False)
         for label in (self.hardware_label, self.disk_label):
             foot.addWidget(label)
+        foot.addWidget(self.notice_label)
         foot.addStretch(1)
         foot.addWidget(self.lives_label)
         root.addSpacing(8)
@@ -1088,11 +1563,15 @@ class MainWindow(QWidget):
             card.stop_requested.connect(self._stop_job)
             card.open_requested.connect(self._open_clips)
             card.export_requested.connect(self._export_clips)
+            card.youtube_requested.connect(self._youtube_clips)
             card.remove_requested.connect(self._remove_job)
             self._cards[status.job_id] = card
             self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
         else:
             card.update_status(status)
+        for clip in status.final_clips:
+            self._clip_jobs[clip] = status.job_id
+        self._auto_post(status)
         self._refresh_visibility()
         self.refresh_footer()
 
@@ -1121,6 +1600,102 @@ class MainWindow(QWidget):
         dest = exporter.destination_for(base, card.status.session_dir, clips)
         self._export_dialog = ExportDialog(clips, dest, card.status.channel, self)
         self._export_dialog.exec()
+
+    # --- YouTube ---
+    def youtube_client(self):
+        if self._yt_client is None:
+            self._yt_client = self._youtube_client_factory()
+        return self._yt_client
+
+    def upload_queue(self):
+        if self._yt_queue is None:
+            self._yt_queue = self._upload_queue_factory(self.youtube_client(), self._yt_bridge.event.emit)
+        return self._yt_queue
+
+    def _youtube_clips(self, job_id: str) -> None:
+        card = self._cards[job_id]
+        connected = bool(self.youtube_client().is_connected())
+        dialog = YouTubeDialog(
+            list(card.status.final_clips), card.status.channel, card.status.platform,
+            self.upload_queue() if connected else None, session_dir=card.status.session_dir,
+            connected=connected, privacy=self._settings.get("youtube_privacy"), parent=self)
+        dialog.settings_requested.connect(lambda: self._settings_from_youtube_dialog(dialog))
+        self._youtube_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._youtube_dialog = None
+
+    def _settings_from_youtube_dialog(self, dialog: QDialog) -> None:
+        dialog.accept()
+        QTimer.singleShot(0, self.open_settings)
+
+    def _auto_post(self, status: JobStatus) -> None:
+        """Posta sozinho os clipes NOVOS de `status.final_clips` (se a opção estiver ligada)."""
+        fresh = [clip for clip in status.final_clips if clip not in self._seen_clips]
+        if not fresh:
+            return
+        self._seen_clips.update(fresh)
+        if (not self._auto_post_ready or not self._settings.get("youtube_auto_upload")
+                or self._auto_post_blocked):
+            return
+        try:
+            if not self.youtube_client().is_connected():
+                return
+            queue = self.upload_queue()
+            for clip in fresh:
+                meta = uploader.build_meta(clip, channel=status.channel, platform=status.platform,
+                                           privacy=self._settings.get("youtube_privacy"))
+                queue.submit(clip, meta, status.session_dir)
+        except Exception:  # noqa: BLE001 - postar é opcional: nunca derruba a atualização da tela
+            logger.exception("Falha na postagem automática no YouTube")
+
+    def _on_upload_event(self, event: uploader.UploadEvent) -> None:
+        clip = Path(event.clip)
+        job_id = self._clip_jobs.get(clip)
+        if job_id is not None:
+            states = self._clip_states.setdefault(job_id, {})
+            states[clip] = {"queued": "queued", "started": "active", "progress": "active",
+                            "done": "done", "failed": "failed"}.get(event.kind, "queued")
+            card = self._cards.get(job_id)
+            if card is not None:
+                card.set_youtube_text(self._youtube_card_text(states))
+        if event.kind == "done":
+            self._notified.clear()
+            self.notice_label.setVisible(False)
+        elif event.kind == "failed" and event.error_kind in ("auth", "quota"):
+            self._notify_youtube_problem(event.error_kind, event.error or "")
+        if self._youtube_dialog is not None:
+            self._youtube_dialog.handle_event(event)
+
+    @staticmethod
+    def _youtube_card_text(states: dict[Path, str]) -> str:
+        values = list(states.values())
+        done, failed = values.count("done"), values.count("failed")
+        waiting = values.count("queued") + values.count("active")
+        if waiting:
+            return f"YouTube: enviando {done + failed + 1} de {len(values)}"
+        parts = []
+        if done:
+            parts.append(f"{done} postado" if done == 1 else f"{done} postados")
+        if failed:
+            parts.append(f"{failed} falhou" if failed == 1 else f"{failed} falharam")
+        return "YouTube: " + ", ".join(parts) if parts else ""
+
+    def _notify_youtube_problem(self, kind: str, message: str) -> None:
+        """Aviso discreto no rodapé, uma vez por problema (nada de caixa de diálogo em loop)."""
+        if kind == "auth":
+            self._auto_post_blocked = True
+        if kind in self._notified:
+            return
+        self._notified.add(kind)
+        text = ("YouTube: o login expirou. Conecte de novo em Ajustes; a postagem automática "
+                "ficou em pausa." if kind == "auth"
+                else "YouTube: a cota diária de envios acabou. Tente de novo amanhã.")
+        self.notice_label.setText(text)
+        self._set_label_flag(self.notice_label, True)
+        self.notice_label.setVisible(True)
+        logger.warning("Aviso do YouTube (%s): %s", kind, message)
 
     def _remove_job(self, job_id: str) -> None:
         try:
@@ -1163,8 +1738,14 @@ class MainWindow(QWidget):
         label.style().polish(label)
 
     def open_settings(self) -> None:
-        dialog = SettingsDialog(self._settings, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        dialog = SettingsDialog(self._settings, self, youtube_client=self.youtube_client())
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        dialog.wait_login()
+        if self._auto_post_blocked and self.youtube_client().is_connected():
+            self._auto_post_blocked = False        # reconectou: o auto-post volta
+            self._notified.discard("auth")
+            self.notice_label.setVisible(False)
+        if accepted:
             self.apply_new_settings(dialog.values())
 
     def apply_new_settings(self, values: dict) -> None:
@@ -1178,8 +1759,11 @@ class MainWindow(QWidget):
 
     # --- fechar ---
     def closeEvent(self, event) -> None:  # noqa: N802 (nome do Qt)
-        if self.active_count() and not self.confirm(
-                "Sair do Auto-Clipper?", "Parar tudo e sair? O que já foi gravado fica salvo no disco."):
+        uploading = self._yt_queue.pending() if self._yt_queue is not None else 0
+        if (self.active_count() or uploading) and not self.confirm(
+                "Sair do Auto-Clipper?",
+                "Parar tudo e sair? O que já foi gravado fica salvo no disco."
+                + (f" {uploading} envio(s) ao YouTube em andamento serão cancelados." if uploading else "")):
             event.ignore()
             return
         self._disk_timer.stop()
@@ -1188,6 +1772,11 @@ class MainWindow(QWidget):
 
     def _shutdown_manager(self) -> None:
         """manager.shutdown(wait=True) pode demorar: roda em thread, sem congelar a janela."""
+        if self._yt_queue is not None:
+            try:
+                self._yt_queue.shutdown()
+            except Exception:  # noqa: BLE001
+                logger.exception("Falha ao encerrar a fila de envio ao YouTube")
         worker = threading.Thread(target=self.manager.shutdown, kwargs={"wait": True},
                                   name="gui-shutdown", daemon=True)
         worker.start()
@@ -1275,6 +1864,26 @@ QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 4px; min-hei
 QScrollBar::handle:vertical:hover {{ background: {FG_FAINT}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
 
+#sectionTitle {{ color: {FG_FAINT}; font-size: 11px; letter-spacing: 1px; padding-top: 8px; }}
+QPushButton::menu-indicator {{ image: none; width: 0; }}
+QMenu {{ background: {SURFACE}; border: 1px solid {BORDER}; padding: 4px; }}
+QMenu::item {{ padding: 7px 24px; background: transparent; color: {FG}; }}
+QMenu::item:selected {{ background: {ACCENT}; color: {BG}; }}
+QMenu::item:disabled {{ color: {FG_FAINT}; }}
+QCheckBox {{ spacing: 8px; background: transparent; }}
+QCheckBox::indicator, QTableView::indicator {{ width: 16px; height: 16px; border: 1px solid {BORDER};
+            border-radius: 3px; background: {SURFACE}; }}
+QCheckBox::indicator:hover, QTableView::indicator:hover {{ border-color: {FG_DIM}; }}
+QCheckBox::indicator:checked, QTableView::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+QCheckBox:focus {{ color: {ACCENT}; }}
+QTableWidget {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: {RADIUS_PX}px;
+            gridline-color: {BORDER}; selection-background-color: {SURFACE_HOVER}; selection-color: {FG}; }}
+QTableWidget::item {{ padding: 6px 4px; }}
+QTableWidget::item:selected {{ background: {SURFACE_HOVER}; color: {FG}; }}
+QTableWidget QLineEdit {{ min-height: 20px; }}
+QHeaderView {{ background: {BG}; }}
+QHeaderView::section {{ background: {BG}; color: {FG_FAINT}; border: none; border-bottom: 1px solid {BORDER};
+            padding: 6px 4px; }}
 QDialog, QMessageBox {{ background: {BG}; }}
 QComboBox {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: {RADIUS_PX}px;
             padding: 6px 12px; min-height: 22px; }}

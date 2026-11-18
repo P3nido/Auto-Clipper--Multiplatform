@@ -50,6 +50,7 @@ auto-clipper/
 ├── hardware.py          # detecção de GPU: NVENC/Quick Sync/AMF/CPU e Whisper CUDA/CPU (ADR-007)
 ├── gui.py               # interface gráfica PySide6
 ├── exporter.py          # copia clipes escolhidos para a pasta do Google Drive (ADR-011)
+├── uploader.py          # posta clipes no YouTube Shorts com a credencial do usuário (ADR-012)
 ├── session.py           # Session/RecordingSegment: pastas, manifesto session.json, relógio
 ├── recorder.py          # Etapa 1 — is_live() e Recorder (Streamlink em subprocess)
 ├── chat_listener.py     # Etapa 2 — ChatMessage, porta ChatSource, adaptadores, ChatListener
@@ -95,6 +96,7 @@ Dependências fluem num sentido só: `main → (recorder, chat_listener, hype_de
 | `engine.py` | `JobManager`, `JobStatus`, `JobState`, `record_session()` (kwargs `on_scan`, `on_session`), `process_session()` (ADR-008, ADR-010) | orquestra N lives + fila de clipes |
 | `main.py` | CLI fina sobre o `engine`: várias `--url`, `--once`, `--process`, `--max-duration`, `--diagnostico` | — |
 | `gui.py` | interface PySide6 sobre o `engine` (ADR-008); "Enviar ao Drive" chama o `exporter` | UI |
+| `uploader.py` | `YouTubeClient`, `UploadQueue`, `VideoMeta`, `UploadRecord`, `UploadEvent`, `build_meta()`, `load_records()`, `save_record()`, `is_posted()`, `UploadError`/`AuthError`/`QuotaError` (ADR-012) | rede (YouTube Data API, opcional) |
 | `exporter.py` | `ExportError`, `ExportResult`, `detect_drive_folder()`, `resolve_export_dir()`, `destination_for()`, `is_already_exported()`, `export_clips()` (ADR-011) | disco (cópia para a pasta do Drive) |
 | `runtime.py` | `is_frozen()`, `app_dir()`, `data_dir()`, `default_sessions_dir()`, `bundled_tool()`, `streamlink_command()`, `subprocess_flags()`, `nvidia_dll_dirs()` (ADR-009) | caminhos do pacote |
 | `launcher_gui.py` / `launcher_cli.py` | entradas do `Auto-Clipper.exe` e do `auto-clipper-cli.exe` (`--run-streamlink`) | — |

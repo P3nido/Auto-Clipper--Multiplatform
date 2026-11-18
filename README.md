@@ -116,10 +116,39 @@ Para quem não quer mexer em terminal: cole o link da live e deixe rodar.
 O app não pede login nem chave: ele só copia os clipes para a pasta do **Google Drive para desktop**, e o próprio Drive envia para a nuvem em segundo plano.
 
 1. Instale o Google Drive para desktop (google.com/drive/download) e entre na sua conta.
-2. No cartão da live, clique em **Enviar ao Drive**, marque os clipes e confirme. Eles vão para `Meu Drive\Auto-Clipper\<pasta da live>\`. Os que já foram enviados aparecem desmarcados.
+2. No cartão da live, clique em **Enviar ▾ > Google Drive**, marque os clipes e confirme. Eles vão para `Meu Drive\Auto-Clipper\<pasta da live>\`. Os que já foram enviados aparecem desmarcados.
 3. Para usar outra pasta (OneDrive, Dropbox, HD externo), vá em **Ajustes > Pasta do Google Drive** e clique em **Escolher…**. **Detectar** volta ao automático.
 
 Só os clipes finais são enviados; a gravação bruta, o áudio e as legendas ficam no computador.
+
+## Postar no YouTube
+
+O app pode postar os clipes direto no seu canal do YouTube (como Shorts). É opcional: sem conectar, tudo funciona como antes. Como o app não tem chave embutida, você cria uma credencial **sua** no Google Cloud (é grátis e leva uns 15 minutos, uma vez só).
+
+1. Entre em **console.cloud.google.com** com a conta do Google do seu canal e crie um projeto novo, chamado `Auto-Clipper`.
+2. No menu, vá em **APIs e serviços > Biblioteca**, procure **YouTube Data API v3** e clique em **Ativar**.
+3. Configure a tela de consentimento (**Google Auth Platform**, nas abas **Branding** e **Público**):
+   - Tipo de público: **Externo**. Preencha o nome do app (`Auto-Clipper`) e o seu e-mail.
+   - Em **Público**, adicione o seu e-mail como **usuário de teste**.
+   - Depois clique em **Publicar app** (fica "Em produção"). Sem isso o login expira a cada 7 dias e você teria de conectar de novo toda semana.
+   - No primeiro login vai aparecer o aviso **"O Google não verificou este app"**. É normal: o app é seu. Clique em **Avançado** e depois em **Acessar Auto-Clipper (não seguro)**.
+4. Em **Clientes**, clique em **Criar cliente**, escolha o tipo **App para computador** e baixe o arquivo **JSON**.
+5. No Auto-Clipper, abra **Ajustes > YouTube > Conectar…**, escolha o JSON baixado e autorize no navegador que vai abrir. Quando aparecer "Login concluído", volte ao app: o status passa a **Conectado**.
+
+Como usar:
+
+- No cartão da live, clique em **Enviar ▾ > YouTube**. Marque os clipes, ajuste os títulos se quiser (a coluna **Título** é editável), escolha a visibilidade (**Público**, **Não listado** ou **Privado**) e clique em **Postar**. Os que já foram postados aparecem desmarcados, com o link; dê dois cliques para abrir.
+- Pode fechar a janela de envio: os envios continuam em segundo plano e o cartão mostra o andamento. Fechar o app cancela o que ainda não terminou.
+- **Postagem automática:** em **Ajustes > YouTube**, marque "Postar automaticamente cada clipe novo". Vem **desligada**. Ela só posta os clipes que forem criados depois que você liga a opção, nunca os antigos.
+- O registro do que já foi postado fica em `youtube.json`, dentro da pasta de cada live, então o app nunca posta o mesmo clipe duas vezes, nem depois de reiniciar.
+
+Limites e avisos:
+
+- O YouTube dá uma cota de cerca de **100 envios por dia** para a sua credencial. Se acabar, o app avisa e você tenta de novo no dia seguinte.
+- Se o YouTube deixar o vídeo como **privado** mesmo você pedindo público, o diálogo avisa. Projetos novos às vezes precisam de verificação do Google; você pode mudar a visibilidade no YouTube Studio.
+- **Onde ficam os dados:** a credencial (`youtube_client_secret.json`) e o token do login (`youtube_token.json`) ficam em `%LOCALAPPDATA%\Auto-Clipper` (no executável) ou na pasta do projeto (código-fonte). Nada disso vai para o git nem para dentro do `.exe`: guarde esses arquivos como uma senha.
+- **Desconectar:** **Ajustes > YouTube > Desconectar** apaga o token e revoga a permissão. Você também pode remover o acesso em myaccount.google.com/permissions.
+- **Conteúdo de terceiros:** os clipes mostram a live de outra pessoa. Só poste com a **permissão** do streamer (e, de preferência, com crédito no título ou na descrição). Postar sem autorização pode gerar reivindicação de direitos autorais ou até a remoção do vídeo e advertências no seu canal. A responsabilidade pelo que é postado é sua.
 
 ## Executável (Windows, sem instalar nada)
 
@@ -149,7 +178,8 @@ O resultado fica em `dist\Auto-Clipper\` (~2,8 GB, com FFmpeg, Streamlink, faste
 ```
 gui.py (interface)  main.py (CLI)  engine.py (várias lives + fila de clipes)
 hardware.py (GPU)  config.py  session.py  recorder.py  chat_listener.py
-hype_detector.py  clipper.py  transcriber.py  tests/  docs/adr/
+hype_detector.py  clipper.py  transcriber.py  exporter.py (Drive)  uploader.py (YouTube)
+tests/  docs/adr/
 requirements.txt  requirements-gpu.txt  requirements-dev.txt
 ```
 

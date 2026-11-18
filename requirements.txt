@@ -20,3 +20,7 @@ av>=16,<19        # PyAV 19 removeu o parâmetro metadata_errors que o faster-wh
 
 # Interface gráfica (gui.py, ADR-008)
 PySide6>=6.8,<7
+
+# Postar no YouTube (opcional, ADR-012). O upload é feito à mão sobre requests; sem google-api-python-client
+google-auth>=2.30,<3
+google-auth-oauthlib>=1.2,<2

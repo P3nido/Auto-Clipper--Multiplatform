@@ -27,3 +27,8 @@ dist/
 dist_next/
 dist_new/
 dist_*/
+
+# Credenciais do YouTube (ADR-012): nunca no git
+client_secret*.json
+youtube_client_secret.json
+youtube_token.json
