@@ -240,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
     urls: list[str] = args.url or [config.STREAM_URL]
     apply_frozen_defaults()
     setup_logging()
+    runtime.kill_children_on_exit()
 
     if args.diagnostico:
         try:

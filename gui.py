@@ -637,6 +637,7 @@ class MainWindow(QWidget):
         self._start_hardware_probe(hardware_probe)
         self._disk_timer = QTimer(self)
         self._disk_timer.timeout.connect(self.refresh_footer)
+        self._disk_timer.timeout.connect(ensure_app_log)
         self._disk_timer.start(DISK_REFRESH_MS)
         for status in self.manager.all():       # lives que já existiam (ex.: demo)
             self._on_status(status)
@@ -994,28 +995,53 @@ _LOG_FILE_BACKUPS = 3
 _GUI_LOG_FORMAT = "%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s"
 
 
-def setup_gui_logging() -> None:
-    """Console (se existir; app "windowed" não tem stderr) + app.log rotativo quando
-    empacotado, onde não há terminal para ver os logs."""
+_APP_LOG_TAG = "_auto_clipper_app_log"
+
+
+def _app_log_handlers() -> list[logging.Handler]:
+    return [h for h in logging.getLogger().handlers if getattr(h, _APP_LOG_TAG, False)]
+
+
+def ensure_app_log() -> bool:
+    """Garante que o app.log rotativo esteja anexado ao root (só empacotado). Idempotente:
+    pode ser chamado de novo (a janela faz isso periodicamente) caso algum código tenha
+    removido ou fechado o handler. Retorna True se o handler está ativo."""
     from logging.handlers import RotatingFileHandler
 
+    if not runtime.is_frozen():
+        return False
+    root = logging.getLogger()
+    for handler in _app_log_handlers():
+        if getattr(handler, "stream", True) is not None:
+            return True
+        root.removeHandler(handler)   # fechado: refaz abaixo
+    path = runtime.data_dir() / "app.log"
+    try:
+        file_handler = RotatingFileHandler(
+            path, maxBytes=_LOG_FILE_BYTES, backupCount=_LOG_FILE_BACKUPS, encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning("Não foi possível abrir %s: %s", path, exc)
+        return False
+    file_handler.setFormatter(logging.Formatter(_GUI_LOG_FORMAT))
+    file_handler.setLevel(logging.NOTSET)
+    setattr(file_handler, _APP_LOG_TAG, True)
+    root.addHandler(file_handler)
+    return True
+
+
+def setup_gui_logging() -> None:
+    """Console (se existir; app "windowed" não tem stderr) + app.log rotativo quando
+    empacotado, onde não há terminal para ver os logs. Recebe INFO+ de todas as lives
+    (o run.log de cada sessão é um handler à parte, filtrado por thread)."""
     root = logging.getLogger()
     root.setLevel(getattr(logging, str(config.LOG_LEVEL).upper(), logging.INFO))
-    formatter = logging.Formatter(_GUI_LOG_FORMAT)
     if sys.stderr is not None and not root.handlers:
         console = logging.StreamHandler()
-        console.setFormatter(formatter)
+        console.setFormatter(logging.Formatter(_GUI_LOG_FORMAT))
         root.addHandler(console)
-    if runtime.is_frozen():
-        try:
-            file_handler = RotatingFileHandler(
-                runtime.data_dir() / "app.log", maxBytes=_LOG_FILE_BYTES,
-                backupCount=_LOG_FILE_BACKUPS, encoding="utf-8",
-            )
-        except OSError:
-            return
-        file_handler.setFormatter(formatter)
-        root.addHandler(file_handler)
+    if ensure_app_log():
+        logger.info("Auto-Clipper iniciado (log em %s)", runtime.data_dir() / "app.log")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1023,6 +1049,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--demo", action="store_true", help="usa lives simuladas (não grava nada)")
     args = parser.parse_args(argv)
     setup_gui_logging()
+    runtime.kill_children_on_exit()   # streamlink/ffmpeg morrem junto com o app, até em crash
     if runtime.is_frozen() and config.SESSIONS_DIR == "sessions":
         config.SESSIONS_DIR = runtime.default_sessions_dir()
     app = create_app()

@@ -124,7 +124,12 @@ def build_video_filter(
     if layout not in _VALID_LAYOUTS:
         raise ValueError(f"layout inválido: {layout!r} (use um de {', '.join(_VALID_LAYOUTS)})")
     w, h = size
-    steps: list[str] = [f"fps={fps}"] if fps is not None else []
+    # format=yuv420p PRIMEIRO: com decode por GPU (d3d11va/cuda) os quadros chegam em
+    # NV12 e o ramo do fundo (scale+boxblur) saía verde/roxo. Normalizar o formato na
+    # entrada deixa GPU e CPU idênticos (bug real visto em 2026-11-18).
+    steps: list[str] = ["format=yuv420p"]
+    if fps is not None:
+        steps.append(f"fps={fps}")
 
     if layout == "vertical_blur":
         sw, sh = w // _BLUR_DOWNSCALE, h // _BLUR_DOWNSCALE

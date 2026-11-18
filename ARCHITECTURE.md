@@ -91,7 +91,7 @@ Dependências fluem num sentido só: `main → (recorder, chat_listener, hype_de
 | `clipper.py` | `ClipSpec`, `plan_clips()`, `build_video_filter()`, `probe_duration()`, `extract_audio()`, `render_clip()`, `cut_clip()`, `ClipperError` | subprocess |
 | `transcriber.py` | `load_model()`, `transcribe_to_srt()`, `format_srt()`, `TranscriberError` | modelo |
 | `hardware.py` | `HardwareProfile`, `detect()`, `encoder_args()`, `decoder_args()`, `prepare_cuda_dlls()`, `diagnose()` (ADR-007) | subprocess (testes de encode) |
-| `engine.py` | `JobManager`, `JobStatus`, `JobState`, `record_session()`, `process_session()` (ADR-008) | orquestra N lives + fila de clipes |
+| `engine.py` | `JobManager`, `JobStatus`, `JobState`, `record_session()` (kwargs `on_scan`, `on_session`), `process_session()` (ADR-008, ADR-010) | orquestra N lives + fila de clipes |
 | `main.py` | CLI fina sobre o `engine`: várias `--url`, `--once`, `--process`, `--max-duration`, `--diagnostico` | — |
 | `gui.py` | interface PySide6 sobre o `engine` (ADR-008) | UI |
 | `runtime.py` | `is_frozen()`, `app_dir()`, `data_dir()`, `default_sessions_dir()`, `bundled_tool()`, `streamlink_command()`, `subprocess_flags()`, `nvidia_dll_dirs()` (ADR-009) | caminhos do pacote |

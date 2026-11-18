@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import atexit
 import re
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import config
 import runtime
 from session import RecordingSegment, Session, now
 
-__all__ = ["RecorderError", "is_live", "Recorder", "remux_to_mp4"]
+__all__ = ["RecorderError", "is_live", "Recorder", "remux_to_mp4", "terminate_all_processes"]
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,55 @@ _POPEN_FLAGS = (
     (subprocess.CREATE_NEW_PROCESS_GROUP | runtime.subprocess_flags())
     if sys.platform == "win32" else 0
 )
+
+
+# Registro dos subprocessos do streamlink vivos: ao sair do app, tudo que sobrar é morto
+# (terminate -> kill), mesmo que as threads de gravação não tenham encerrado a tempo.
+_LIVE_PROCS: set[subprocess.Popen] = set()
+_LIVE_PROCS_LOCK = threading.Lock()
+
+
+def _register_process(proc: subprocess.Popen) -> None:
+    with _LIVE_PROCS_LOCK:
+        _LIVE_PROCS.add(proc)
+    runtime.assign_to_kill_on_close_job(proc)
+
+
+def _unregister_process(proc: subprocess.Popen) -> None:
+    with _LIVE_PROCS_LOCK:
+        _LIVE_PROCS.discard(proc)
+
+
+def terminate_all_processes(timeout: float = _TERMINATE_TIMEOUT_S) -> int:
+    """Encerra todos os streamlink ainda vivos: terminate() em todos de uma vez, espera até
+    `timeout` no total e dá kill() no que sobrar. Retorna quantos estavam vivos. Seguro
+    para chamar várias vezes (inclusive do atexit)."""
+    with _LIVE_PROCS_LOCK:
+        procs = [p for p in _LIVE_PROCS if p.poll() is None]
+    for proc in procs:
+        try:
+            proc.terminate()
+        except OSError:
+            logger.debug("terminate() falhou", exc_info=True)
+    deadline = time.monotonic() + timeout
+    for proc in procs:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            logger.warning("streamlink (pid %s) não encerrou a tempo; enviando kill().", proc.pid)
+            try:
+                proc.kill()
+                proc.wait(timeout=_TERMINATE_TIMEOUT_S)
+            except (OSError, subprocess.TimeoutExpired):
+                logger.warning("Não foi possível matar o streamlink pid %s", proc.pid)
+    with _LIVE_PROCS_LOCK:
+        for proc in procs:
+            if proc.poll() is not None:
+                _LIVE_PROCS.discard(proc)
+    return len(procs)
+
+
+atexit.register(terminate_all_processes)
 
 
 class RecorderError(RuntimeError):
@@ -188,6 +238,7 @@ class Recorder:
         except FileNotFoundError as exc:
             raise RecorderError(f"Não foi possível executar o streamlink: {exc}") from exc
 
+        _register_process(proc)
         # O nome deriva da thread que grava (ex.: "job-ab12cd-recorder-streamlink"): o
         # filtro de log por live (engine.py) reconhece o prefixo "job-<id>".
         reader = threading.Thread(
@@ -205,6 +256,7 @@ class Recorder:
         finally:
             if proc.poll() is None:
                 self._stop_process(proc)
+            _unregister_process(proc)
             reader.join(timeout=_READER_JOIN_TIMEOUT_S)
 
         self._mark_start_if_data(segment)

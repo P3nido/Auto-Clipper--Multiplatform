@@ -24,7 +24,7 @@ import config
 from chat_listener import ChatListener, channel_from_url, detect_platform, make_chat_source
 from clipper import ClipperError, ClipSpec, extract_audio, plan_clips, probe_duration, render_clip
 from hype_detector import bucketize, detect_spike_buckets, finalized_spikes, find_spikes
-from recorder import Recorder, RecorderError, is_live
+from recorder import Recorder, RecorderError, is_live, terminate_all_processes
 from session import Session, now
 from transcriber import load_model, transcribe_to_srt
 
@@ -46,6 +46,7 @@ _POLL_SLICE_S = 0.5
 _SHUTDOWN_WAIT_S = 55.0   # teto total de shutdown(wait=True); a UI espera até 90 s
 _PROGRESS_INTERVAL_S = 2.0
 _RECORDER_JOIN_S = 15.0
+_SHUTDOWN_GRACE_S = 3.0   # espera extra após matar os streamlink restantes
 _CHAT_JOIN_S = 10.0
 _JOB_PREFIX = "job-"
 _POST_THREAD_NAME = "postprocess"
@@ -189,7 +190,8 @@ def _recording_stats(session: Session, listener: ChatListener | None) -> dict:
 
 def record_session(url: str, stop_event, *, max_duration: float | None = None,
                    on_progress: Callable[[dict], None] | None = None, job_tag: str = "job",
-                   on_scan: Callable[[Session], None] | None = None):
+                   on_scan: Callable[[Session], None] | None = None,
+                   on_session: Callable[[Session], None] | None = None):
     """Grava UMA live (antigo main.run_session, sem o tratamento de Ctrl+C, que é da CLI).
     Threads nomeadas com o prefixo `job_tag`; o run.log da sessão só recebe linhas
     desse prefixo. on_progress recebe dicts {"recorded_s","recorded_bytes","chat_messages"}
@@ -197,13 +199,36 @@ def record_session(url: str, stop_event, *, max_duration: float | None = None,
 
     Extensão (ADR-010): `on_scan(session)` opcional é chamado a cada
     config.LIVE_SCAN_INTERVAL_S durante a gravação (clipagem ao vivo); qualquer exceção
-    dele é registrada e a gravação continua."""
+    dele é registrada e a gravação continua.
+
+    `on_session(session)` opcional é chamado logo que a sessão é criada (o JobManager o usa
+    para poder fechar a sessão se o shutdown estourar o teto)."""
     session = Session.create(url, Path(config.SESSIONS_DIR))
+    if on_session is not None:
+        try:
+            on_session(session)
+        except Exception:  # noqa: BLE001
+            logger.exception("on_session falhou")
     log_handler = _attach_session_log(session.log_path, job_tag)
     try:
         return _record_into(session, url, stop_event, max_duration, on_progress, job_tag, on_scan)
     finally:
         _detach_session_log(log_handler)
+
+
+def _finalize_interrupted(session: Session) -> None:
+    """Fecha a sessão de uma gravação que não terminou normalmente: segmentos abertos
+    ganham wall_end e o status de gravação vira "interrompido". Idempotente."""
+    try:
+        closed_at = now()
+        for seg in session.segments:
+            if seg.wall_end is None:
+                seg.wall_end = closed_at
+        if not session.status.get("record"):
+            session.status["record"] = "interrompido"
+        session.save()
+    except Exception:  # noqa: BLE001
+        logger.exception("Não foi possível fechar a sessão %s", session.root)
 
 
 def _record_into(session: Session, url: str, stop_event, max_duration: float | None,
@@ -584,6 +609,7 @@ class _Job:
         self.done_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.session: Session | None = None
+        self.recording_session: Session | None = None   # sessão em gravação (para o shutdown)
         self.outcome: dict = {}
         self.processing = False
         # Clipagem ao vivo (ADR-010)
@@ -711,9 +737,11 @@ class JobManager:
             return [job.status for job in self._jobs.values()]
 
     def shutdown(self, wait: bool = True) -> None:
+        """Pede a parada de TODOS os jobs primeiro e só então espera (em paralelo, com teto
+        total de _SHUTDOWN_WAIT_S). Com wait=True garante, mesmo se o teto estourar, que nenhum
+        streamlink fique vivo e que toda sessão tenha wall_end e status "interrompido"."""
         self._shutdown.set()
-        with self._lock:
-            jobs = list(self._jobs.values())
+        jobs = self._snapshot_jobs()
         for job in jobs:
             job.stop_event.set()
         if not wait:
@@ -725,6 +753,24 @@ class JobManager:
             thread.join(max(0.0, deadline - time.monotonic()))
             if thread.is_alive():
                 logger.warning("Thread %s não encerrou a tempo no shutdown", thread.name)
+        # Rede de segurança: nada de streamlink órfão, nem sessão sem fechamento.
+        terminate_all_processes()
+        for job in jobs:
+            if job.thread is not None and job.thread.is_alive():
+                job.thread.join(_SHUTDOWN_GRACE_S)
+            session = job.recording_session
+            if session is not None:
+                _finalize_interrupted(session)
+
+    def _snapshot_jobs(self) -> list[_Job]:
+        """Lista de jobs sem travar para sempre se o lock estiver preso por um callback."""
+        if self._lock.acquire(timeout=2.0):
+            try:
+                return list(self._jobs.values())
+            finally:
+                self._lock.release()
+        logger.warning("Lock do motor ocupado no shutdown; usando a lista sem lock")
+        return list(self._jobs.copy().values())
 
     # --- internos ---------------------------------------------------------
     def _notify(self, snapshot: JobStatus) -> None:
@@ -796,6 +842,7 @@ class JobManager:
                 on_progress=on_record, job_tag=job.tag,
                 on_scan=(lambda sess, _job=job: self._live_scan(_job, sess))
                 if config.LIVE_CLIPPING else None,
+                on_session=lambda sess, _job=job: setattr(_job, "recording_session", sess),
             )
             job.session = session
             job.outcome = {}
