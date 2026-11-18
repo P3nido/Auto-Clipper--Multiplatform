@@ -160,3 +160,30 @@ def test_missing_chat_and_invalid_lines(session):
     assert find_spikes(session) == []
     _write_chat(session, _flat_with_burst(T0, 30, 20), extra_lines=("lixo", '{"text": "sem ts"}'))
     assert len(find_spikes(session)) == 1
+
+
+# --- finalized_spikes (clipagem ao vivo, ADR-010) ---------------------------
+from hype_detector import finalized_spikes
+
+LIVE = dict(PARAMS, post_s=15, margin_s=5)
+LIVE_COUNTS = [4] * 20 + [20] + [4] * 3   # pico no bloco 20 (centro em 205 s)
+
+
+def test_finalized_cooldown_not_elapsed_does_not_close():
+    # bloco 20 termina em 210 s; com now=235 só passaram 25 s (< cooldown de 30)
+    assert finalized_spikes(LIVE_COUNTS, now_offset_s=235, recorded_s=1000, **LIVE) == []
+
+
+def test_finalized_window_not_recorded_does_not_close():
+    # cooldown ok, mas 205 + 15 + 5 = 225 > 224
+    assert finalized_spikes(LIVE_COUNTS, now_offset_s=300, recorded_s=224, **LIVE) == []
+
+
+def test_finalized_closes_when_both_ok():
+    assert finalized_spikes(LIVE_COUNTS, now_offset_s=300, recorded_s=300, **LIVE) == [(20, 4.0)]
+
+
+def test_finalized_burst_still_chaining_does_not_close():
+    counts = [4] * 20 + [20, 4, 25] + [4] * 3   # bloco 22 encadeia com o 20 (20 s < cooldown)
+    assert finalized_spikes(counts, now_offset_s=250, recorded_s=1000, **LIVE) == []
+    assert [i for i, _ in finalized_spikes(counts, now_offset_s=300, recorded_s=1000, **LIVE)] == [22]

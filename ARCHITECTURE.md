@@ -87,7 +87,7 @@ Dependências fluem num sentido só: `main → (recorder, chat_listener, hype_de
 | `session.py` | `Session`, `RecordingSegment`, `now()` | disco (manifesto) |
 | `recorder.py` | `is_live(url)`, `Recorder`, `remux_to_mp4()`, `RecorderError` | subprocess, disco |
 | `chat_listener.py` | `ChatMessage`, `ChatSource` (+ `TwitchIRCSource`, `KickHistorySource`, `YouTubeInnerTubeSource`), `detect_platform()`, `channel_from_url()`, `make_chat_source()`, `ChatListener` | rede, disco |
-| `hype_detector.py` | `Spike`, `bucketize()`, `detect_spike_buckets()`, `find_spikes()` | só `find_spikes` lê disco |
+| `hype_detector.py` | `Spike`, `bucketize()`, `detect_spike_buckets()`, `finalized_spikes()`, `find_spikes()` | só `find_spikes` lê disco |
 | `clipper.py` | `ClipSpec`, `plan_clips()`, `build_video_filter()`, `probe_duration()`, `extract_audio()`, `render_clip()`, `cut_clip()`, `ClipperError` | subprocess |
 | `transcriber.py` | `load_model()`, `transcribe_to_srt()`, `format_srt()`, `TranscriberError` | modelo |
 | `hardware.py` | `HardwareProfile`, `detect()`, `encoder_args()`, `decoder_args()`, `prepare_cuda_dlls()`, `diagnose()` (ADR-007) | subprocess (testes de encode) |
@@ -120,6 +120,8 @@ Implementado como funções puras em `hype_detector.py`, totalmente testáveis s
 3. O bloco *i* é pico se: `i ≥ WARMUP_BUCKETS` **e** `count ≥ SPIKE_MULTIPLIER × base` **e** `count ≥ MIN_MESSAGES_PER_BUCKET`. O piso absoluto evita que 1→4 mensagens num chat parado conte como "hype".
 4. Cooldown: candidatos a menos de `SPIKE_COOLDOWN_S` do candidato **anterior** formam uma mesma rajada, que vai se encadeando. Da rajada fica só o bloco de maior contagem (no empate, o primeiro). Assim, um hype longo e contínuo vira **um** clipe, e não vários clipes colados.
 5. O instante do pico é o **centro** do bloco.
+
+**Clipagem ao vivo (ADR-010):** durante a gravação, o motor roda o mesmo algoritmo a cada `LIVE_SCAN_INTERVAL_S` sobre o trecho já gravado do segmento atual (leitura incremental do `chat.jsonl`) e usa `finalized_spikes()` para saber quais picos estão "fechados": a rajada acabou (cooldown depois do último candidato dela) e `pico + CLIP_POST_S + LIVE_SAFETY_MARGIN_S` já está gravado. Cada pico fechado vira uma tarefa de clipe na fila única; a passada final só gera o que não se sobrepõe a janelas já clipadas. `MAX_CLIPS` passa a valer como "os N primeiros". `LIVE_CLIPPING = False` desliga tudo.
 
 ## 6. Concorrência e encerramento
 
@@ -161,6 +163,8 @@ Cada clipe tem **um único encode de vídeo** (otimização medida em ARCHITECTU
 - `horizontal`: mantém o 16:9.
 
 Nos layouts verticais, a legenda usa `SUBTITLE_STYLE_VERTICAL`.
+
+**Clipagem ao vivo (ADR-010):** a thread `postprocess` aceita dois tipos de tarefa na fila única, "clipe" (extrair áudio, transcrever e renderizar um clipe, lendo o `.ts` ainda em gravação até o trecho já escrito) e "final da sessão" (detecção completa e clipes restantes). Os dois usam o mesmo `_make_clip`; a numeração `clip_NN_...` é contínua por sessão.
 
 ## 9. Tratamento de erros
 

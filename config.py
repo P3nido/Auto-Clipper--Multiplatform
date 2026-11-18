@@ -13,7 +13,7 @@ Os demais têm padrões sensatos e estão documentados no ARCHITECTURE.md.
 STREAM_URL = "https://www.twitch.tv/NOME_DO_CANAL"
 
 # Um bloco de 10 s vira "pico" quando tem X vezes mais mensagens que a média recente.
-SPIKE_MULTIPLIER = 3.0
+SPIKE_MULTIPLIER = 1.8
 
 # Modelo do Whisper: "auto" (large-v3-turbo na GPU NVIDIA, small na CPU) ou
 # "tiny", "base", "small", "medium", "large-v3-turbo", "large-v3".
@@ -41,14 +41,14 @@ YOUTUBE_MAX_POLL_INTERVAL_S = 5.0   # teto da espera entre consultas ao chat do 
 BUCKET_SECONDS = 10             # tamanho de cada bloco de contagem
 BASELINE_WINDOW_BUCKETS = 30    # média móvel sobre os últimos 30 blocos (= 5 min)
 WARMUP_BUCKETS = 6              # ignora o primeiro 1 min (média ainda instável)
-MIN_MESSAGES_PER_BUCKET = 5     # piso absoluto, evita "pico" em chat quase parado
+MIN_MESSAGES_PER_BUCKET = 3     # piso absoluto, evita "pico" em chat quase parado
 SPIKE_COOLDOWN_S = 30           # distância mínima entre dois picos
 CHAT_DELAY_OFFSET_S = 0.0       # o chat reage depois do lance: desloca o pico p/ trás
 
 # --- Etapa 4: recorte ---------------------------------------------------
 CLIP_PRE_S = 15                 # segundos antes do pico
 CLIP_POST_S = 15                # segundos depois do pico
-MAX_CLIPS = 30                  # limite por live (mantém os picos mais fortes)
+MAX_CLIPS = 60                  # limite por live (com clipagem ao vivo: os primeiros 60)
 FFMPEG_BIN = "ffmpeg"           # ou caminho completo, ex.: r"C:\ffmpeg\bin\ffmpeg.exe"
 FFPROBE_BIN = "ffprobe"
 # Formato do clipe final (ADR-006):
@@ -98,6 +98,11 @@ WHISPER_DEVICE = "auto"         # "auto" | "cuda" | "cpu"
 # --- Várias lives (ADR-008) ---------------------------------------------
 MAX_PARALLEL_LIVES = 4          # lives gravando/monitorando ao mesmo tempo
 POSTPROCESS_WORKERS = 1         # clipes gerados um de cada vez (não disputar a GPU)
+
+# --- Clipagem ao vivo (ADR-010) -----------------------------------------
+LIVE_CLIPPING = True            # gera os clipes DURANTE a live (False = tudo só no fim)
+LIVE_SCAN_INTERVAL_S = 30       # de quanto em quanto tempo procura picos novos no chat
+LIVE_SAFETY_MARGIN_S = 5        # folga: o fim da janela precisa estar gravado com esta sobra
 
 # --- Saída --------------------------------------------------------------
 SESSIONS_DIR = "sessions"

@@ -17,7 +17,7 @@ from pathlib import Path
 import config
 from session import Session
 
-__all__ = ["Spike", "bucketize", "detect_spike_buckets", "find_spikes"]
+__all__ = ["Spike", "bucketize", "detect_spike_buckets", "finalized_spikes", "find_spikes"]
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,23 @@ def detect_spike_buckets(
     até o candidato ANTERIOR da rajada ((j - i) * bucket_s) for < cooldown_s.
     Assim uma rajada longa e contínua vira um único pico (a rajada "encadeia").
     """
-    peaks: list[tuple[int, float]] = []
+    return [(i, baseline) for i, baseline, _last in _detect_bursts(
+        counts, bucket_s=bucket_s, multiplier=multiplier, baseline_window=baseline_window,
+        warmup=warmup, min_messages=min_messages, cooldown_s=cooldown_s)]
+
+
+def _detect_bursts(
+    counts: Sequence[int],
+    *,
+    bucket_s: float,
+    multiplier: float,
+    baseline_window: int,
+    warmup: int,
+    min_messages: int,
+    cooldown_s: float,
+) -> list[tuple[int, float, int]]:
+    """Como detect_spike_buckets, mas devolve (indice, baseline, ultimo_candidato_da_rajada)."""
+    peaks: list[tuple[int, float, int]] = []
     burst_best: tuple[int, float] | None = None  # (índice, baseline) do melhor da rajada
     last_candidate = -1
     for i, count in enumerate(counts):
@@ -91,12 +107,53 @@ def detect_spike_buckets(
                 burst_best = (i, baseline)
         else:
             if burst_best is not None:
-                peaks.append(burst_best)
+                peaks.append((burst_best[0], burst_best[1], last_candidate))
             burst_best = (i, baseline)
         last_candidate = i
     if burst_best is not None:
-        peaks.append(burst_best)
+        peaks.append((burst_best[0], burst_best[1], last_candidate))
     return peaks
+
+
+def finalized_spikes(
+    counts: Sequence[int],
+    *,
+    now_offset_s: float,
+    bucket_s: float,
+    multiplier: float,
+    baseline_window: int,
+    warmup: int,
+    min_messages: int,
+    cooldown_s: float,
+    post_s: float,
+    recorded_s: float,
+    margin_s: float,
+) -> list[tuple[int, float]]:
+    """Picos "fechados" (que não mudam mais) de uma contagem parcial, para a clipagem ao vivo.
+
+    PURA. `counts` cobre o segmento atual do início até agora (o último bloco pode estar
+    incompleto). Um pico do bloco i só é devolvido se:
+      1. a rajada dele acabou: now_offset_s - (ultimo_candidato_da_rajada + 1) * bucket_s
+         >= cooldown_s (nenhum candidato novo pode se encadear nem trocar o melhor da
+         rajada; para rajada de um só bloco, o último candidato é o próprio i);
+      2. o fim da janela já está gravado: (i + 0.5) * bucket_s + post_s + margin_s
+         <= recorded_s.
+    Os dois tempos são relativos ao início do segmento, em tempo de PAREDE. Com anúncios
+    removidos o vídeo é mais curto que o relógio: o chamador deve conferir de novo a
+    condição 2 em tempo de vídeo (ver engine). Retorna [(bloco, baseline)] crescente.
+    """
+    bursts = _detect_bursts(
+        counts, bucket_s=bucket_s, multiplier=multiplier, baseline_window=baseline_window,
+        warmup=warmup, min_messages=min_messages, cooldown_s=cooldown_s,
+    )
+    closed: list[tuple[int, float]] = []
+    for i, baseline, last in bursts:
+        if now_offset_s - (last + 1) * bucket_s < cooldown_s:
+            continue
+        if (i + 0.5) * bucket_s + post_s + margin_s > recorded_s:
+            continue
+        closed.append((i, baseline))
+    return closed
 
 
 def _read_chat_timestamps(path: Path) -> list[float]:

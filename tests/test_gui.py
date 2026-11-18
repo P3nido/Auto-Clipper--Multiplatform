@@ -118,6 +118,21 @@ def test_open_clips_enabled_only_with_clips(window, tmp_path, monkeypatch):
     assert opened == [clip.parent]
 
 
+def test_recording_card_shows_live_clips_and_enables_open(window, tmp_path):
+    window.url_edit.setText("https://www.twitch.tv/gaules")
+    window.add_live()
+    job_id = next(iter(window._cards))
+    card = window._cards[job_id]
+    window.manager.update(job_id, state=JobState.RECORDING, recorded_s=600, spikes=2, clips_total=2)
+    assert card.stats["clips"].value.text() == "0 de 2"
+    assert not card.stats["clips"].isHidden()
+    assert not card.open_button.isEnabled()
+    clip = tmp_path / "final" / "clip_01.mp4"
+    window.manager.update(job_id, clips_done=1, final_clips=(clip,))
+    assert card.stats["clips"].value.text() == "1 de 2"
+    assert card.open_button.isEnabled() and card.stop_button.isVisibleTo(window)
+
+
 def test_stop_asks_confirmation(window, monkeypatch):
     window.url_edit.setText("https://www.twitch.tv/gaules")
     window.add_live()

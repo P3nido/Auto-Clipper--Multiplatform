@@ -7,7 +7,9 @@ thread de UI (ex.: Qt Signal). Nunca bloqueie dentro do callback.
 """
 from __future__ import annotations
 
+import json
 import logging
+import math
 import queue
 import re
 import threading
@@ -20,8 +22,8 @@ from pathlib import Path
 
 import config
 from chat_listener import ChatListener, channel_from_url, detect_platform, make_chat_source
-from clipper import ClipperError, extract_audio, plan_clips, probe_duration, render_clip
-from hype_detector import find_spikes
+from clipper import ClipperError, ClipSpec, extract_audio, plan_clips, probe_duration, render_clip
+from hype_detector import bucketize, detect_spike_buckets, finalized_spikes, find_spikes
 from recorder import Recorder, RecorderError, is_live
 from session import Session, now
 from transcriber import load_model, transcribe_to_srt
@@ -186,21 +188,27 @@ def _recording_stats(session: Session, listener: ChatListener | None) -> dict:
 
 
 def record_session(url: str, stop_event, *, max_duration: float | None = None,
-                   on_progress: Callable[[dict], None] | None = None, job_tag: str = "job"):
+                   on_progress: Callable[[dict], None] | None = None, job_tag: str = "job",
+                   on_scan: Callable[[Session], None] | None = None):
     """Grava UMA live (antigo main.run_session, sem o tratamento de Ctrl+C, que é da CLI).
     Threads nomeadas com o prefixo `job_tag`; o run.log da sessão só recebe linhas
     desse prefixo. on_progress recebe dicts {"recorded_s","recorded_bytes","chat_messages"}
-    (mais "session_dir" na primeira chamada). Retorna a Session."""
+    (mais "session_dir" na primeira chamada). Retorna a Session.
+
+    Extensão (ADR-010): `on_scan(session)` opcional é chamado a cada
+    config.LIVE_SCAN_INTERVAL_S durante a gravação (clipagem ao vivo); qualquer exceção
+    dele é registrada e a gravação continua."""
     session = Session.create(url, Path(config.SESSIONS_DIR))
     log_handler = _attach_session_log(session.log_path, job_tag)
     try:
-        return _record_into(session, url, stop_event, max_duration, on_progress, job_tag)
+        return _record_into(session, url, stop_event, max_duration, on_progress, job_tag, on_scan)
     finally:
         _detach_session_log(log_handler)
 
 
 def _record_into(session: Session, url: str, stop_event, max_duration: float | None,
-                 on_progress: Callable[[dict], None] | None, job_tag: str) -> Session:
+                 on_progress: Callable[[dict], None] | None, job_tag: str,
+                 on_scan: Callable[[Session], None] | None = None) -> Session:
     logger.info("Sessão iniciada em %s", session.root)
     # O Recorder/ChatListener usam um evento interno (o Recorder o seta ao terminar);
     # o stop_event do chamador é só o pedido de parada.
@@ -232,6 +240,7 @@ def _record_into(session: Session, url: str, stop_event, max_duration: float | N
     interrupted = False
     started = time.monotonic()
     next_progress = started
+    next_scan = started + float(config.LIVE_SCAN_INTERVAL_S)
     rec_thread.start()
     if chat_thread is not None:
         chat_thread.start()
@@ -248,6 +257,12 @@ def _record_into(session: Session, url: str, stop_event, max_duration: float | N
         if time.monotonic() >= next_progress:
             emit()
             next_progress = time.monotonic() + _PROGRESS_INTERVAL_S
+        if on_scan is not None and time.monotonic() >= next_scan:
+            next_scan = time.monotonic() + float(config.LIVE_SCAN_INTERVAL_S)
+            try:
+                on_scan(session)
+            except Exception:  # noqa: BLE001 - a varredura nunca derruba a gravação
+                logger.warning("Varredura de picos ao vivo falhou; a gravação continua", exc_info=True)
 
     inner_stop.set()
     rec_thread.join(_RECORDER_JOIN_S)
@@ -285,25 +300,176 @@ def _get_model(model_cache: dict | None):
         return model_cache["model"]
 
 
+def _make_clip(session: Session, model, src: Path, spec: ClipSpec, name: str) -> Path:
+    """Gera UM clipe (áudio -> legenda -> render). Usado pela passada final e pela
+    clipagem ao vivo. Levanta exceção se o render falhar; o .wav temporário some sempre."""
+    wav = session.clips_dir / f"{name}.wav"
+    try:
+        srt: Path | None = None
+        try:
+            extract_audio(src, spec, wav)
+        except ClipperError as exc:
+            logger.warning("clipe %s sem áudio utilizável (%s); renderizando sem legenda", name, exc)
+        else:
+            srt = transcribe_to_srt(model, wav, session.subs_dir / f"{name}.srt")
+        return render_clip(src, spec, session.final_dir / f"{name}.mp4", srt)
+    finally:
+        wav.unlink(missing_ok=True)
+
+
+def _overlaps(windows: list[tuple[float, float]], start: float, end: float) -> bool:
+    """Janelas que se tocam (fim == início) contam como sobrepostas, como em plan_clips."""
+    return any(start <= w_end and w_start <= end for w_start, w_end in windows)
+
+
+class _LiveScanner:
+    """Clipagem ao vivo (ADR-010): lê o chat.jsonl de forma incremental e decide quais
+    picos já estão "fechados". Usado só pela thread do job (sem locks)."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+        self._offset = 0                              # bytes já consumidos de chat.jsonl
+        self._times: list[float] = []                 # wall_ts já ajustados por CHAT_DELAY_OFFSET_S
+        self._handled: set[tuple[int, int]] = set()   # (segmento, bloco) já decididos
+        self._peaks: dict[int, int] = {}              # picos detectados por segmento
+        self._frozen: set[int] = set()                # segmentos encerrados e já varridos
+        self.windows: dict[int, list[tuple[float, float]]] = {}   # janelas enfileiradas
+        self.clip_count = 0                           # clipes enfileirados (numeração contínua)
+        self._warned_max = False
+
+    @property
+    def spikes_total(self) -> int:
+        return sum(self._peaks.values())
+
+    def _read_new(self) -> None:
+        path = self.session.chat_path
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        if size < self._offset:   # arquivo recomeçou: relê do zero
+            self._offset = 0
+            self._times = []
+        if size == self._offset:
+            return
+        with open(path, "rb") as fh:
+            fh.seek(self._offset)
+            data = fh.read(size - self._offset)
+        cut = data.rfind(b"\n")
+        if cut < 0:               # linha ainda incompleta
+            return
+        chunk = data[:cut + 1]
+        self._offset += len(chunk)
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ts = float(json.loads(line)["wall_ts"])
+                if not math.isfinite(ts):
+                    raise ValueError("wall_ts não finito")
+            except (ValueError, KeyError, TypeError):
+                continue
+            self._times.append(ts - config.CHAT_DELAY_OFFSET_S)
+
+    @staticmethod
+    def _video_length(seg, upto_wall: float) -> float:
+        """Segundos de vídeo já gravados até `upto_wall` (descontando anúncios removidos)."""
+        length = upto_wall - (seg.wall_start or upto_wall)
+        for ad_start, ad_dur in list(seg.ad_breaks):
+            if ad_start < upto_wall:
+                length -= min(ad_dur, upto_wall - ad_start)
+        return length
+
+    def scan(self) -> list[tuple[ClipSpec, str]]:
+        """Varre o chat até agora e devolve os clipes NOVOS (spec, nome) a enfileirar."""
+        self._read_new()
+        current = now()
+        adjusted_now = current - config.CHAT_DELAY_OFFSET_S
+        bucket_s = config.BUCKET_SECONDS
+        common = dict(
+            bucket_s=bucket_s, multiplier=config.SPIKE_MULTIPLIER,
+            baseline_window=config.BASELINE_WINDOW_BUCKETS, warmup=config.WARMUP_BUCKETS,
+            min_messages=config.MIN_MESSAGES_PER_BUCKET, cooldown_s=config.SPIKE_COOLDOWN_S,
+        )
+        new: list[tuple[ClipSpec, str]] = []
+        for seg in list(self.session.segments):
+            if seg.wall_start is None or seg.index in self._frozen:
+                continue
+            closed = seg.wall_end is not None
+            end = seg.wall_end if closed else adjusted_now
+            if end <= seg.wall_start:
+                continue
+            counts = bucketize([t for t in self._times if seg.wall_start <= t < end],
+                               seg.wall_start, end, bucket_s)
+            self._peaks[seg.index] = len(detect_spike_buckets(counts, **common))
+            raw_end = seg.wall_end if closed else current
+            video_len = self._video_length(seg, raw_end)
+            ready = finalized_spikes(
+                counts, now_offset_s=adjusted_now - seg.wall_start,
+                post_s=config.CLIP_POST_S, recorded_s=raw_end - seg.wall_start,
+                margin_s=config.LIVE_SAFETY_MARGIN_S, **common,
+            )
+            for idx, _baseline in ready:
+                if (seg.index, idx) in self._handled:
+                    continue
+                offset = seg.wall_to_offset(seg.wall_start + (idx + 0.5) * bucket_s)
+                if offset is None:   # pico em anúncio
+                    self._handled.add((seg.index, idx))
+                    continue
+                if offset + config.CLIP_POST_S + config.LIVE_SAFETY_MARGIN_S > video_len:
+                    continue         # anúncios encurtaram o vídeo: tenta na próxima varredura
+                self._handled.add((seg.index, idx))
+                start = max(0.0, offset - config.CLIP_PRE_S)
+                stop = offset + config.CLIP_POST_S
+                if _overlaps(self.windows.get(seg.index, []), start, stop):
+                    continue
+                if 0 <= config.MAX_CLIPS <= self.clip_count:
+                    if not self._warned_max:
+                        logger.info("MAX_CLIPS (%d) atingido; novos picos ficam sem clipe", config.MAX_CLIPS)
+                        self._warned_max = True
+                    continue
+                self.windows.setdefault(seg.index, []).append((start, stop))
+                self.clip_count += 1
+                spec = ClipSpec(seg.index, start, stop - start, int(counts[idx]))
+                new.append((spec, _clip_name(self.clip_count, seg.index, start)))
+                logger.info("Pico fechado no segmento %d (%.0f s, %d msgs): clipe %d enfileirado",
+                            seg.index, offset, counts[idx], self.clip_count)
+            if closed:
+                self._frozen.add(seg.index)
+        return new
+
+
 def process_session(session, *, model_cache: dict | None = None,
                     on_progress: Callable[[dict], None] | None = None,
-                    stop_event: threading.Event | None = None) -> list[Path]:
+                    stop_event: threading.Event | None = None,
+                    already: dict[int, list[tuple[float, float]]] | None = None,
+                    index_offset: int = 0, delete_raw_ok: bool = True) -> list[Path]:
     """Pós-processamento de UMA sessão (antigo main.postprocess). on_progress recebe
     {"spikes","clips_done","clips_total"}. model_cache reaproveita o modelo Whisper
     entre chamadas. Retorna os clipes finais.
 
     Extensão compatível do contrato: `stop_event` (opcional) interrompe entre clipes
-    (usado pelo JobManager.shutdown); o resultado fica "parcial"."""
+    (usado pelo JobManager.shutdown); o resultado fica "parcial".
+
+    Extensão (ADR-010, passada final da clipagem ao vivo): `already` = janelas
+    (início, fim) por segmento que já viraram clipe ao vivo (são puladas); `index_offset` =
+    quantos clipes já existem (numeração continua e o progresso soma a eles); MAX_CLIPS vale
+    para o total; `delete_raw_ok=False` impede apagar a gravação bruta. Retorna só os
+    clipes NOVOS."""
     log_handler = _attach_session_log(session.log_path, _current_job_tag())
     try:
-        return _process_into(session, model_cache, on_progress, stop_event)
+        return _process_into(session, model_cache, on_progress, stop_event,
+                             already, index_offset, delete_raw_ok)
     finally:
         _detach_session_log(log_handler)
 
 
 def _process_into(session: Session, model_cache: dict | None,
                   on_progress: Callable[[dict], None] | None,
-                  stop_event: threading.Event | None) -> list[Path]:
+                  stop_event: threading.Event | None,
+                  already: dict[int, list[tuple[float, float]]] | None = None,
+                  index_offset: int = 0, delete_raw_ok: bool = True) -> list[Path]:
     def emit(**info: object) -> None:
         if on_progress is None:
             return
@@ -313,7 +479,8 @@ def _process_into(session: Session, model_cache: dict | None,
             logger.exception("on_progress falhou")
 
     spikes = find_spikes(session)
-    emit(spikes=len(spikes), clips_done=0, clips_total=0)
+    base = index_offset
+    emit(spikes=len(spikes), clips_done=base, clips_total=base)
 
     durations: dict[int, float] = {}
     sources: dict[int, Path] = {}
@@ -329,19 +496,29 @@ def _process_into(session: Session, model_cache: dict | None,
 
     specs = plan_clips(
         spikes, durations,
-        pre_s=config.CLIP_PRE_S, post_s=config.CLIP_POST_S, max_clips=config.MAX_CLIPS,
+        pre_s=config.CLIP_PRE_S, post_s=config.CLIP_POST_S,
+        max_clips=config.MAX_CLIPS if already is None else -1,
     )
+    if already is not None:
+        specs = [
+            sp for sp in specs
+            if not _overlaps(already.get(sp.segment_index, []), sp.start_s, sp.start_s + sp.duration_s)
+        ]
+        room = max(0, config.MAX_CLIPS - base)
+        if config.MAX_CLIPS >= 0 and len(specs) > room:
+            ranked = sorted(specs, key=lambda c: (-c.peak_count, c.segment_index, c.start_s))
+            specs = sorted(ranked[:room], key=lambda c: (c.segment_index, c.start_s))
     if not specs:
         logger.info("Nenhum clipe a gerar (%d pico(s))", len(spikes))
         session.status["postprocess"] = "ok: 0/0 clipes"
         session.save()
-        emit(spikes=len(spikes), clips_done=0, clips_total=0)
+        emit(spikes=len(spikes), clips_done=base, clips_total=base)
         return []
 
     total = len(specs)
-    emit(spikes=len(spikes), clips_done=0, clips_total=total)
+    emit(spikes=len(spikes), clips_done=base, clips_total=base + total)
     if model_cache is None or "model" not in model_cache:
-        emit(spikes=len(spikes), clips_done=0, clips_total=total, message=_MODEL_LOADING_MESSAGE)
+        emit(spikes=len(spikes), clips_done=base, clips_total=base + total, message=_MODEL_LOADING_MESSAGE)
     try:
         model = _get_model(model_cache)
     except Exception as exc:  # noqa: BLE001
@@ -357,32 +534,21 @@ def _process_into(session: Session, model_cache: dict | None,
             logger.info("Encerrando antes do clipe %d/%d (parada solicitada)", i, total)
             stopped_early = True
             break
-        emit(spikes=len(spikes), clips_done=i - 1, clips_total=total)
+        emit(spikes=len(spikes), clips_done=base + i - 1, clips_total=base + total)
         began = time.monotonic()
-        name = _clip_name(i, spec.segment_index, spec.start_s)
-        src = sources[spec.segment_index]
-        wav = session.clips_dir / f"{name}.wav"
+        name = _clip_name(base + i, spec.segment_index, spec.start_s)
         try:
-            srt: Path | None = None
-            try:
-                extract_audio(src, spec, wav)
-            except ClipperError as exc:
-                logger.warning("clipe %s sem áudio utilizável (%s); renderizando sem legenda", name, exc)
-            else:
-                srt = transcribe_to_srt(model, wav, session.subs_dir / f"{name}.srt")
-            final = render_clip(src, spec, session.final_dir / f"{name}.mp4", srt)
+            final = _make_clip(session, model, sources[spec.segment_index], spec, name)
         except Exception:  # noqa: BLE001 - um clipe ruim não derruba os outros
             logger.exception("clipe %d/%d falhou (%s)", i, total, name)
             continue
-        finally:
-            wav.unlink(missing_ok=True)
         finals.append(final)
         logger.info("clipe %d/%d pronto (%.1f s)", i, total, time.monotonic() - began)
 
     done = len(finals)
     outcome = "ok" if done == total else ("parcial" if done else "erro")
     session.status["postprocess"] = f"{outcome}: {done}/{total} clipes"
-    if config.DELETE_RAW_AFTER_PROCESS and done == total and not stopped_early:
+    if config.DELETE_RAW_AFTER_PROCESS and delete_raw_ok and done == total and not stopped_early:
         for path in sources.values():
             try:
                 path.unlink()
@@ -390,13 +556,23 @@ def _process_into(session: Session, model_cache: dict | None,
             except OSError as exc:
                 logger.warning("Não foi possível apagar %s: %s", path, exc)
     session.save()
-    emit(spikes=len(spikes), clips_done=done, clips_total=total)
+    emit(spikes=len(spikes), clips_done=base + done, clips_total=base + total)
     return finals
 
 
 # --------------------------------------------------------------------------
 # JobManager
 # --------------------------------------------------------------------------
+@dataclass
+class _Task:
+    """Item da fila única: um clipe ao vivo ("clip") ou o fim da sessão ("final")."""
+
+    kind: str
+    job: "_Job"
+    spec: ClipSpec | None = None
+    name: str = ""
+
+
 class _Job:
     """Estado interno de um job (a UI só vê JobStatus)."""
 
@@ -410,6 +586,11 @@ class _Job:
         self.session: Session | None = None
         self.outcome: dict = {}
         self.processing = False
+        # Clipagem ao vivo (ADR-010)
+        self.live: _LiveScanner | None = None
+        self.live_finals: list[Path] = []
+        self.live_done = 0        # tarefas de clipe terminadas (com ou sem sucesso)
+        self.live_failed = 0
 
     @property
     def tag(self) -> str:
@@ -446,7 +627,7 @@ class JobManager:
         self._on_update = on_update
         self._lock = threading.RLock()
         self._jobs: dict[str, _Job] = {}
-        self._queue: queue.Queue[_Job] = queue.Queue()
+        self._queue: queue.Queue[_Task] = queue.Queue()
         self._shutdown = threading.Event()
         self._model_cache: dict = {}
         workers = max(1, int(config.POSTPROCESS_WORKERS))
@@ -593,6 +774,11 @@ class JobManager:
             self._update(job, state=JobState.RECORDING, message="Conectando à live",
                          error=None, session_dir=None, spikes=0, clips_done=0, clips_total=0,
                          final_clips=())
+            with self._lock:
+                job.live = None
+                job.live_finals = []
+                job.live_done = 0
+                job.live_failed = 0
 
             def on_record(info: dict, _job: _Job = job) -> None:
                 changes = {
@@ -608,13 +794,15 @@ class JobManager:
             session = record_session(
                 job.status.url, job.stop_event, max_duration=job.max_duration,
                 on_progress=on_record, job_tag=job.tag,
+                on_scan=(lambda sess, _job=job: self._live_scan(_job, sess))
+                if config.LIVE_CLIPPING else None,
             )
             job.session = session
             job.outcome = {}
             job.done_event.clear()
             self._update(job, state=JobState.QUEUED, message="Na fila para gerar clipes",
                          session_dir=session.root)
-            self._queue.put(job)
+            self._queue.put(_Task("final", job))
             while not job.done_event.wait(_POLL_SLICE_S):
                 if self._shutdown.is_set() and not job.processing:
                     # a thread de clipes pode já ter saído: descarta aqui mesmo
@@ -656,14 +844,61 @@ class JobManager:
                 return
             logger.info("Job %s: aguardando a próxima live", job.status.job_id)
 
+    # --- clipagem ao vivo (ADR-010) ----------------------------------------
+    def _live_scan(self, job: _Job, session: Session) -> None:
+        """Chamado pela thread do job durante a gravação: enfileira os picos fechados."""
+        if job.live is None:
+            job.live = _LiveScanner(session)
+        new = job.live.scan()
+        for spec, name in new:
+            self._queue.put(_Task("clip", job, spec, name))
+        self._update(job, spikes=job.live.spikes_total, clips_total=job.live.clip_count)
+
+    def _run_clip_task(self, task: _Task) -> None:
+        """Gera um clipe ao vivo. Só mexe nos contadores; o estado do job não muda."""
+        job = task.job
+        session = job.live.session if job.live is not None else job.session
+        assert session is not None and task.spec is not None
+        thread = threading.current_thread()
+        original_name = thread.name
+        thread.name = f"{job.tag}-post"
+        handler = _attach_session_log(session.log_path, job.tag)
+        final: Path | None = None
+        try:
+            if self._shutdown.is_set():
+                logger.info("Encerrando: clipe %s não gerado", task.name)
+            else:
+                try:
+                    src = session.segments[task.spec.segment_index].path
+                    model = _get_model(self._model_cache)
+                    began = time.monotonic()
+                    final = _make_clip(session, model, src, task.spec, task.name)
+                    logger.info("clipe ao vivo %s pronto (%.1f s)", task.name, time.monotonic() - began)
+                except Exception:  # noqa: BLE001 - um clipe ruim não derruba os outros
+                    logger.exception("clipe ao vivo %s falhou", task.name)
+        finally:
+            _detach_session_log(handler)
+            thread.name = original_name
+            with self._lock:
+                job.live_done += 1
+                if final is not None:
+                    job.live_finals.append(final)
+                else:
+                    job.live_failed += 1
+                self._update(job, clips_done=job.live_done, final_clips=tuple(job.live_finals))
+
     # --- fila de clipes ----------------------------------------------------
     def _post_loop(self) -> None:
         while True:
             try:
-                job = self._queue.get(timeout=_POLL_SLICE_S)
+                task = self._queue.get(timeout=_POLL_SLICE_S)
             except queue.Empty:
                 if self._shutdown.is_set():
                     return
+                continue
+            job = task.job
+            if task.kind == "clip":
+                self._run_clip_task(task)
                 continue
             if self._shutdown.is_set():
                 logger.info(
@@ -681,8 +916,13 @@ class JobManager:
         thread.name = f"{job.tag}-post"
         job.processing = True
         try:
+            # Com vários workers um clipe ao vivo pode ainda estar rodando: espera.
+            while job.live is not None and job.live_done < job.live.clip_count and not self._shutdown.is_set():
+                time.sleep(_POLL_SLICE_S / 5)
+            live_count = job.live.clip_count if job.live is not None else 0
+            live_finals = list(job.live_finals)
             self._update(job, state=JobState.PROCESSING, message="Preparando os clipes",
-                         clips_done=0, clips_total=0)
+                         clips_done=job.live_done, clips_total=live_count)
 
             def on_post(info: dict) -> None:
                 done = int(info.get("clips_done", 0))
@@ -701,22 +941,28 @@ class JobManager:
 
             assert job.session is not None
             try:
+                extra: dict = {}
+                if live_count:
+                    extra = dict(
+                        already={k: list(v) for k, v in job.live.windows.items()},
+                        index_offset=live_count, delete_raw_ok=job.live_failed == 0,
+                    )
                 finals = process_session(
                     job.session, model_cache=self._model_cache, on_progress=on_post,
-                    stop_event=self._shutdown,
+                    stop_event=self._shutdown, **extra,
                 )
                 status = job.session.status.get("postprocess", "")
-                if status.startswith("erro"):
+                if status.startswith("erro") and not live_finals:
                     detail = status.partition(":")[2].strip() or status
                     match = re.fullmatch(r"0/(\d+) clipes", detail)
                     if match:
                         detail = f"nenhum dos {match.group(1)} clipes pôde ser gerado"
                     job.outcome = {"error": detail}
                 else:
-                    job.outcome = {"finals": list(finals)}
+                    job.outcome = {"finals": live_finals + list(finals)}
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Pós-processamento do job %s falhou", job.status.job_id)
-                job.outcome = {"error": str(exc)}
+                job.outcome = {"error": str(exc)} if not live_finals else {"finals": live_finals}
         finally:
             thread.name = original_name
             job.processing = False

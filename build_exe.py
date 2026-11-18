@@ -1,6 +1,6 @@
 """Gera o executável do Auto-Clipper (ADR-009).
 
-Uso: python build_exe.py
+Uso: python build_exe.py [--out PASTA]   (padrão: dist; use outra pasta se o app em dist estiver aberto)
 
 1. limpa build/ e dist/;  2. roda o PyInstaller com auto_clipper.spec;
 3. copia ffmpeg/ffprobe para dist/Auto-Clipper/ffmpeg/ e escreve o LEIA-ME.txt;
@@ -89,7 +89,15 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, text=True, encoding="utf-8", errors="replace", **kwargs)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    global DIST
+    parser = argparse.ArgumentParser(description="Gera o executável do Auto-Clipper")
+    parser.add_argument("--out", default="dist", help="pasta de saída (padrão: dist)")
+    args = parser.parse_args(argv)
+    out_root = (ROOT / args.out).resolve()
+    DIST = out_root / "Auto-Clipper"
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     started = time.monotonic()
 
@@ -101,11 +109,12 @@ def main() -> int:
             return 1
         tools[name] = path
 
-    for folder in ("build", "dist"):
-        shutil.rmtree(ROOT / folder, ignore_errors=True)
+    for folder in (ROOT / "build", out_root):
+        shutil.rmtree(folder, ignore_errors=True)
 
     logger.info("Rodando o PyInstaller (pode levar vários minutos)...")
-    proc = _run([sys.executable, "-m", "PyInstaller", str(SPEC), "--noconfirm", "--clean"], cwd=ROOT)
+    proc = _run([sys.executable, "-m", "PyInstaller", str(SPEC), "--noconfirm", "--clean",
+                 "--distpath", str(out_root)], cwd=ROOT)
     if proc.returncode != 0:
         logger.error("PyInstaller falhou (código %d)", proc.returncode)
         return proc.returncode

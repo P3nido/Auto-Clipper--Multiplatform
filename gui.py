@@ -89,7 +89,7 @@ LAYOUT_CHOICES = (
     ("Horizontal (como a live)", "horizontal"),
 )
 LANGUAGE_CHOICES = (("Português", "pt"), ("Detectar automaticamente", None))
-SENSITIVITY_CHOICES = (("Baixa", 4.0), ("Média", 3.0), ("Alta", 2.2))
+SENSITIVITY_CHOICES = (("Baixa (só momentos enormes)", 3.0), ("Média", 2.2), ("Alta (recomendado)", 1.8), ("Máxima", 1.5))
 SETTINGS_KEYS = ("output_layout", "whisper_language", "spike_multiplier", "sessions_dir")
 
 
@@ -277,7 +277,8 @@ class FakeJobManager:
     def _seed(self) -> None:
         self._create("https://www.twitch.tv/gaules", "twitch", "gaules", JobState.RECORDING,
                      "Gravando vídeo e chat", recorded_s=4350, recorded_bytes=3_600_000_000,
-                     chat_messages=12480, spikes=7)
+                     chat_messages=12480, spikes=7, clips_done=2, clips_total=3,
+                     final_clips=(self._clips_dir / "clip_01.mp4", self._clips_dir / "clip_02.mp4"))
         self._create("https://kick.com/casimito", "kick", "casimito", JobState.PROCESSING,
                      "Gerando clipes e legendas", recorded_s=7260, recorded_bytes=6_100_000_000,
                      chat_messages=30210, spikes=8, clips_done=3, clips_total=8)
@@ -289,11 +290,20 @@ class FakeJobManager:
         self._ticks += 1
         for job in self.all():
             if job.state == JobState.RECORDING:
+                changes: dict = {}
+                # Clipagem ao vivo (ADR-010): cada pico vira clipe pouco depois.
+                if self._ticks % 25 == 0:
+                    changes["spikes"] = job.spikes + 1
+                    changes["clips_total"] = job.clips_total + 1
+                elif job.clips_done < job.clips_total and self._ticks % 7 == 0:
+                    self._clips_dir.mkdir(parents=True, exist_ok=True)
+                    done = job.clips_done + 1
+                    changes["clips_done"] = done
+                    changes["final_clips"] = job.final_clips + (self._clips_dir / f"clip_{done:02d}.mp4",)
                 self.update(job.job_id, recorded_s=job.recorded_s + 1,
                             recorded_bytes=job.recorded_bytes + 830_000,
                             chat_messages=job.chat_messages + 6,
-                            spikes=job.spikes + (1 if self._ticks % 25 == 0 else 0),
-                            message="Gravando vídeo e chat")
+                            message="Gravando vídeo e chat", **changes)
             elif job.state == JobState.PROCESSING and self._ticks % 3 == 0:
                 done = job.clips_done + 1
                 if done >= job.clips_total:

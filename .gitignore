@@ -24,3 +24,4 @@ settings.json
 # PyInstaller
 build/
 dist/
+dist_next/

@@ -124,6 +124,7 @@ O resultado fica em `dist\Auto-Clipper\` (~2,8 GB, com FFmpeg, Streamlink, faste
 
 ## Dicas
 
+- **Clipes durante a live:** os clipes saem enquanto a live acontece, alguns minutos depois de cada momento (e já dá para abrir a pasta). Para voltar ao modo antigo (tudo só no fim), use `LIVE_CLIPPING = False` em `config.py`.
 - **Formato do clipe:** `OUTPUT_LAYOUT = "vertical_blur"` (padrão: vídeo inteiro sobre fundo desfocado, nada da tela é perdido), `"vertical_crop"` (tela cheia, corta as laterais e costuma cortar a webcam) ou `"horizontal"` (16:9 como a live).
 - **Tamanho da legenda:** os blocos têm no máximo `SUBTITLE_MAX_CHARS = 40` caracteres (~2 linhas) e `SUBTITLE_MAX_CUE_S = 3.0` segundos. `SUBTITLE_MAX_CHARS = 0` volta às frases inteiras do Whisper.
 - **Live em outro idioma:** use `WHISPER_LANGUAGE = None` em `config.py` para o Whisper detectar o idioma. Forçar `"pt"` numa live em francês gera legenda vazia ou sem sentido.

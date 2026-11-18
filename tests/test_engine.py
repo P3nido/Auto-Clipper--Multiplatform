@@ -573,3 +573,124 @@ def test_process_log_goes_to_session_run_log(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "load_model", lambda: object())
     engine.process_session(session)
     assert "clipe 1/1 pronto" in session.log_path.read_text(encoding="utf-8")
+
+
+# --- clipagem ao vivo (ADR-010) -------------------------------------------
+import json as _json
+
+T0 = 1_000_000.0
+
+
+def _live_setup(monkeypatch, tmp_path, clock, gate=None, spikes_final=()):
+    monkeypatch.setattr(config, "LIVE_CLIPPING", True)
+    monkeypatch.setattr(config, "LIVE_SCAN_INTERVAL_S", 0.05)
+    monkeypatch.setattr(config, "CHAT_DELAY_OFFSET_S", 0.0)
+    monkeypatch.setattr(engine, "now", lambda: clock[0])
+    made: list[str] = []
+
+    class Rec:
+        def __init__(self, session, stop_event):
+            self.session, self.stop_event = session, stop_event
+
+        def run(self):
+            seg = self.session.new_segment()
+            seg.path.write_bytes(b"x" * 100)
+            seg.wall_start = T0
+            lines = []
+            for b in range(0, 40):    # 4 msgs por bloco de 10 s; pico de 30 no bloco 10
+                for k in range(30 if b == 10 else 4):
+                    lines.append(_json.dumps({"wall_ts": T0 + b * 10 + 0.1 * k}))
+            self.session.chat_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.stop_event.wait()
+
+    _patch_record(monkeypatch, Rec)
+    monkeypatch.setattr(engine, "is_live", lambda url: True)
+    monkeypatch.setattr(engine, "_get_model", lambda cache: object())
+
+    def fake_make(session, model, src, spec, name):
+        if gate is not None:
+            gate.wait(10)
+        out = session.final_dir / f"{name}.mp4"
+        out.write_bytes(b"f")
+        made.append(name)
+        return out
+
+    monkeypatch.setattr(engine, "_make_clip", fake_make)
+    monkeypatch.setattr(engine, "find_spikes", lambda s: list(spikes_final))
+    monkeypatch.setattr(engine, "probe_duration", lambda p: 1000.0)
+    return made
+
+
+def test_live_clip_enqueued_during_recording_and_final_pass_no_duplicates(managers, monkeypatch, tmp_path):
+    clock = [T0 + 60]
+    gate = threading.Event()
+    # a passada final vê o pico já clipado (centro 105) e um novo em 300 s
+    made = _live_setup(monkeypatch, tmp_path, clock, gate,
+                       spikes_final=[Spike(0, 105.0, 30, 4.0), Spike(0, 300.0, 30, 4.0)])
+    m = managers()
+    job_id = m.add(URL)
+    _wait_state(m, job_id, JobState.RECORDING)
+    assert _wait_until(lambda: m.status(job_id).chat_messages == 7)
+    time.sleep(0.3)
+    assert m.status(job_id).clips_total == 0          # cooldown/gravação ainda não permitem
+    clock[0] = T0 + 400
+    assert _wait_until(lambda: m.status(job_id).clips_total == 1)
+    st = m.status(job_id)
+    assert st.state == JobState.RECORDING and st.clips_done == 0 and st.spikes >= 1
+    gate.set()
+    assert _wait_until(lambda: m.status(job_id).clips_done == 1)
+    st = m.status(job_id)
+    assert st.state == JobState.RECORDING and len(st.final_clips) == 1
+    assert st.final_clips[0].name == "clip_01_seg0_01m30s.mp4"
+    m.stop(job_id)
+    _wait_state(m, job_id, *TERMINAL)
+    st = m.status(job_id)
+    assert st.state == JobState.DONE and st.message == "Pronto: 2 clipes"
+    assert made == ["clip_01_seg0_01m30s", "clip_02_seg0_04m45s"]
+    assert len(st.final_clips) == 2
+
+
+def test_live_final_pass_with_nothing_new_keeps_live_clips(managers, monkeypatch, tmp_path):
+    clock = [T0 + 400]
+    made = _live_setup(monkeypatch, tmp_path, clock, spikes_final=[Spike(0, 105.0, 30, 4.0)])
+    m = managers()
+    job_id = m.add(URL)
+    assert _wait_until(lambda: m.status(job_id).clips_done == 1)
+    m.stop(job_id)
+    _wait_state(m, job_id, *TERMINAL)
+    st = m.status(job_id)
+    assert st.state == JobState.DONE and st.message == "Pronto: 1 clipe" and len(made) == 1
+
+
+def test_live_clipping_disabled_keeps_old_behaviour(managers, monkeypatch, tmp_path):
+    clock = [T0 + 400]
+    made = _live_setup(monkeypatch, tmp_path, clock, spikes_final=[Spike(0, 105.0, 30, 4.0)])
+    monkeypatch.setattr(config, "LIVE_CLIPPING", False)
+    m = managers()
+    job_id = m.add(URL)
+    _wait_state(m, job_id, JobState.RECORDING)
+    time.sleep(0.4)
+    assert m.status(job_id).clips_total == 0 and made == []
+    m.stop(job_id)
+    _wait_state(m, job_id, *TERMINAL)
+    assert made == ["clip_01_seg0_01m30s"] and m.status(job_id).state == JobState.DONE
+
+
+def test_live_scan_exception_does_not_kill_recording(managers, monkeypatch, tmp_path):
+    clock = [T0 + 400]
+    _live_setup(monkeypatch, tmp_path, clock, spikes_final=[])
+    calls = []
+
+    def boom(self):
+        calls.append(1)
+        raise RuntimeError("varredura quebrou")
+
+    monkeypatch.setattr(engine._LiveScanner, "scan", boom)
+    m = managers()
+    job_id = m.add(URL)
+    assert _wait_until(lambda: len(calls) >= 2)       # continua tentando
+    assert m.status(job_id).state == JobState.RECORDING
+    m.stop(job_id)
+    _wait_state(m, job_id, *TERMINAL)
+    assert m.status(job_id).state == JobState.DONE
+    assert m.status(job_id).message == "Nenhum momento de destaque encontrado"
